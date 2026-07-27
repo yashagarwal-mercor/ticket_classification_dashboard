@@ -112,13 +112,3 @@ fits well. The dashboard then shows, per workflow: ticket count, % of total,
 total hours, % of total hours, AHT, FRR, touches/ticket, and complexity tier.
 Filter by company or tier, sort by clicking any column header, and export to
 clipboard/Excel (either a single flattened sheet, or one tab per company).
-
-## Notes
-
-- The dashboard's "Total Tickets" is always exactly the sum of the Ticket
-  Count column (or the row count, if that column isn't mapped) — reclassifying
-  or editing the rubric can move tickets between workflows but can never
-  change this total. If the total looks wrong, check the Ticket Count mapping
-  first.
-- Batches that fail (e.g. API error) leave their rows unclassified rather than
-  blocking the whole run; you'll see a warning with the failure count.
