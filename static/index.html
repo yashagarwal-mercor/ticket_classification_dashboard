@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Ticket Workflow Classifier &amp; Dashboard</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<h1>Ticket Workflow Classifier &amp; Dashboard</h1>
+<div class="subtitle">Upload a ticket spreadsheet, set your complexity thresholds, and let AI infer the column mapping and workflow rubric for you — review before it runs.</div>
+
+<div id="setupSection">
+
+  <div class="panel">
+    <h2><span class="step-label">1</span>Ticket Spreadsheet</h2>
+    <div class="field-row">
+      <div class="field" style="flex: 2 1 320px;">
+        <label for="fileInput">Upload .xlsx or .csv</label>
+        <input type="file" id="fileInput" accept=".xlsx,.xls,.csv">
+      </div>
+    </div>
+    <div class="hint" id="rowCountHint"></div>
+  </div>
+
+  <div class="panel">
+    <h2><span class="step-label">2</span>Complexity Tier Thresholds</h2>
+    <div class="threshold-grid">
+      <div></div>
+      <div class="col-head">Min FRR (%)</div>
+      <div class="col-head">Max AHT (min)</div>
+      <div class="col-head">Max Touches/Ticket</div>
+
+      <div class="tier-label low">Low</div>
+      <input type="number" id="thLowFrr" value="70">
+      <input type="number" id="thLowAht" value="30">
+      <input type="number" id="thLowTouches" value="1.7" step="0.1">
+
+      <div class="tier-label medium">Medium</div>
+      <input type="number" id="thMedFrr" value="50">
+      <input type="number" id="thMedAht" value="60">
+      <input type="number" id="thMedTouches" placeholder="(no limit)" disabled>
+
+      <div class="tier-label high">High</div>
+      <div style="grid-column: span 3; color: var(--text-dim); font-size: 12px;">Everything else</div>
+    </div>
+    <div class="hint" style="margin-top:10px;">A workflow is Low if FRR ≥ Low-FRR AND AHT ≤ Low-AHT AND Touches ≤ Low-Touches. Medium if FRR ≥ Med-FRR AND AHT ≤ Med-AHT. Otherwise High. Editable live, before and after classification.</div>
+    <button class="btn secondary small" id="resetThresholdsBtn">Reset to defaults</button>
+  </div>
+
+  <div class="panel" id="analyzePanel" style="display:none;">
+    <h2><span class="step-label">3</span>Auto-map Columns <span style="font-weight:400; color:var(--text-dim); font-size:13px;">(optional)</span></h2>
+    <div class="hint">Optional helper: reads the headers and a sample of rows and fills in the column mapping below (company, hours, touches, ticket-count, etc). Always review what it picks. You can also skip this and map the columns yourself. The workflow rubric is not generated — you write it in step 5.</div>
+    <button class="btn" id="analyzeBtn">Infer Column Mapping with AI</button>
+    <span id="analyzeStatus" style="margin-left:10px; font-size:12.5px;"></span>
+  </div>
+
+  <div class="panel" id="reviewPanel" style="display:none;">
+    <h2><span class="step-label">4</span>Review: Column Mapping</h2>
+    <div class="field-row">
+      <div class="field">
+        <label for="colCompany">Company column (optional)</label>
+        <select id="colCompany"></select>
+      </div>
+      <div class="field">
+        <label for="colHours">Hours column *</label>
+        <select id="colHours"></select>
+      </div>
+      <div class="field">
+        <label for="colTouches">Touches column *</label>
+        <select id="colTouches"></select>
+      </div>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label for="colFirstRes">First-Touch-Resolved / CountFirstResolution (optional)</label>
+        <select id="colFirstRes"></select>
+      </div>
+      <div class="field">
+        <label for="colTicketCount">Ticket Count (optional — for pre-aggregated data)</label>
+        <select id="colTicketCount"></select>
+      </div>
+    </div>
+    <div class="field-row">
+      <div class="field" style="flex: 1 1 100%;">
+        <label>Classification text column(s) * — select one or more; if more than one, they're combined per row</label>
+        <div id="textColsChecklist" class="checklist"></div>
+      </div>
+    </div>
+    <div class="hint">"Ticket Count" is for pre-aggregated exports where each row already represents a group of N tickets (e.g. one row per tag combo per month) rather than one row per ticket — leave blank if every row is a single ticket.</div>
+  </div>
+
+  <div class="panel" id="rubricPanel" style="display:none;">
+    <h2><span class="step-label">5</span>Define: Workflow Rubric</h2>
+    <div class="hint" style="margin-bottom:12px;">You define the workflows tickets get classified into. Paste them in bulk below (one per line: <code>Name | Category | Description</code>, Category optional), or build the list row by row in the table. Each ticket is matched to the single best-fitting workflow name; anything that fits none lands in "Unclassified / Other".</div>
+    <div class="field-row">
+      <div class="field" style="flex: 1 1 100%;">
+        <label for="rubricPaste">Enter your workflow rubric — one workflow per line: <code>Name | Category | Description</code> (Category optional)</label>
+        <textarea id="rubricPaste" placeholder="Password Reset | Identity & Access | Employee-initiated password resets, usually self-service.&#10;MFA Setup | Identity & Access | Enrolling or resetting multi-factor authentication."></textarea>
+      </div>
+    </div>
+    <button class="btn secondary small" id="parseRubricBtn">Parse pasted text into table below</button>
+    <div style="margin-top:14px;">
+      <table class="rubric-table" id="rubricTable">
+        <thead><tr><th>Name</th><th>Category</th><th>Description</th><th></th></tr></thead>
+        <tbody id="rubricTableBody"></tbody>
+      </table>
+      <button class="btn secondary small" id="addRubricRowBtn">+ Add row</button>
+    </div>
+  </div>
+
+  <div class="error-banner" id="errorBanner"></div>
+
+  <div class="panel" id="classifyPanel" style="display:none;">
+    <button class="btn" id="classifyBtn">Classify Tickets &amp; Build Dashboard</button>
+    <div class="progress-wrap" id="progressWrap" style="display:none;">
+      <div class="progress-bar-outer"><div class="progress-bar-inner" id="progressBarInner"></div></div>
+      <div class="progress-text" id="progressText"></div>
+      <button class="btn secondary small" id="cancelBtn" style="margin-top:10px;">Cancel</button>
+    </div>
+  </div>
+
+</div>
+
+<div id="dashboardSection">
+  <div class="panel" style="display:flex; gap:10px; align-items:center;">
+    <button class="btn secondary small" id="startOverBtn">&larr; Start Over</button>
+    <div class="spacer"></div>
+    <button class="btn secondary small" id="exportCsvBtn">Export Excel (by Company)</button>
+    <button class="btn secondary small" id="exportBtn">See in Excel</button>
+  </div>
+
+  <div class="summary" id="summaryStats"></div>
+
+  <div class="controls">
+    <label for="companyFilter">Company</label>
+    <select id="companyFilter"></select>
+    <label for="tierFilter">Complexity</label>
+    <select id="tierFilter">
+      <option value="all">All Tiers</option>
+      <option value="low">Low</option>
+      <option value="medium">Medium</option>
+      <option value="high">High</option>
+    </select>
+    <div class="spacer"></div>
+  </div>
+
+  <div class="table-scroll">
+  <table class="dash">
+    <thead>
+      <tr>
+        <th data-key="category">Category</th>
+        <th data-key="workflow">Workflow</th>
+        <th data-key="tickets" class="num-cell">Tickets</th>
+        <th data-key="ticketPct" class="num-cell">% of Tickets</th>
+        <th data-key="hours" class="num-cell">Total Hours</th>
+        <th data-key="hoursPct" class="num-cell">% of Total Hours</th>
+        <th data-key="aht" class="num-cell">AHT (min)</th>
+        <th data-key="frr" class="num-cell">FRR</th>
+        <th data-key="touches" class="num-cell">Touches/Ticket</th>
+        <th data-key="tier">Complexity</th>
+      </tr>
+    </thead>
+    <tbody id="tableBody"></tbody>
+  </table>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<div class="modal-backdrop" id="modalBackdrop">
+  <div class="modal">
+    <h3>Copy failed automatically</h3>
+    <p>Select all the text below (it's pre-selected) and copy it manually with Ctrl/Cmd+C, then paste into Excel.</p>
+    <textarea id="modalTextarea" readonly></textarea>
+    <button onclick="document.getElementById('modalBackdrop').classList.remove('show')">Close</button>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

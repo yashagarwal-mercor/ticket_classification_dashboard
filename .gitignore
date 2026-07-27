@@ -1,0 +1,5 @@
+server.log
+__pycache__/
+*.pyc
+.claude/settings.local.json
+.DS_Store
