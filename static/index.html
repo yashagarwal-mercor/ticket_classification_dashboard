@@ -50,10 +50,17 @@
 
   <div class="panel" id="analyzePanel" style="display:none;">
     <h2><span class="step-label">3</span>Map Columns</h2>
-    <div class="hint">For a standard TechOne time-entry export, click <strong>TechOne preset</strong> to fill the mapping in one click. Otherwise let AI infer it from the headers, or map by hand in step 4. Always review before grouping. The workflow rubric is not generated — you supply it in step 5.</div>
-    <button class="btn" id="presetBtn">TechOne preset</button>
-    <button class="btn secondary" id="analyzeBtn">Infer Column Mapping with AI</button>
-    <span id="analyzeStatus" style="margin-left:10px; font-size:12.5px;"></span>
+    <div class="hint">Fill the mapping by uploading a saved mapping file (e.g. <code>sample_data/techone_mapping.json</code> for the standard TechOne export), or let AI infer it from the headers. You can also map by hand in step 4. Always review before grouping.</div>
+    <div class="field-row" style="align-items:flex-end;">
+      <div class="field" style="flex: 1 1 320px;">
+        <label for="mappingFileInput">Upload a saved column mapping (.json)</label>
+        <input type="file" id="mappingFileInput" accept=".json,application/json">
+      </div>
+      <div class="field" style="flex: 0 0 auto;">
+        <button class="btn secondary" id="analyzeBtn">Infer Column Mapping with AI</button>
+      </div>
+    </div>
+    <span id="analyzeStatus" style="font-size:12.5px;"></span>
   </div>
 
   <div class="panel" id="reviewPanel" style="display:none;">
@@ -117,6 +124,7 @@
     </div>
     <div style="margin-top:14px;">
       <button class="btn" id="groupBtn">Group into ticket records</button>
+      <button class="btn secondary" id="downloadMappingBtn">Download this mapping</button>
       <span id="groupStatus" style="margin-left:10px; font-size:12.5px;"></span>
     </div>
     <div class="hint" id="groupSummary" style="margin-top:10px; display:none;"></div>

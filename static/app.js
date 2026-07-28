@@ -14,20 +14,14 @@ const COL_SELECTS = {
 };
 const REQUIRED_COLS = ['instance', 'ticketnumber', 'startdate', 'summarynotes', 'hoursWorked'];
 
-// One-click mapping for a standard TechOne time-entry export (exact header names).
-const TECHONE_PRESET = {
-  instance_column: 'all_time_entries[instance]',
-  ticketnumber_column: 'all_time_entries[ticketnumber]',
-  startdate_column: 'all_time_entries[startdatetime]',
-  summarynotes_column: 'all_time_entries[summarynotes]',
-  internalnotes_column: 'all_time_entries[internalnotes]',
-  kpi_label_column: 'all_time_entries[KPI_detail_level01]',
-  hours_worked_column: '[Sumhoursworked]',
-  hours_to_bill_column: '[Sumhourstobill]',
-  nonbillable_column: 'all_time_entries[isnonbillable]',
-  roles_column: 'all_roles[name]',
-  billingcodes_column: 'all_billingcodes[name]',
-  contracttype_column: 'all_time_entries[contracttype]',
+// Mapping-file schema: select id <-> file key (e.g. colInstance <-> instance_column).
+// Used to load a saved mapping (upload) and to export the current one (download).
+// applyColumnMapping() consumes the *_column keys; getColumnMapping() reads the short keys.
+const MAPPING_FILE_KEYS = {
+  colInstance: 'instance_column', colTicketNumber: 'ticketnumber_column', colStartDate: 'startdate_column',
+  colSummaryNotes: 'summarynotes_column', colInternalNotes: 'internalnotes_column', colKpiLabel: 'kpi_label_column',
+  colHoursWorked: 'hours_worked_column', colHoursToBill: 'hours_to_bill_column', colNonBillable: 'nonbillable_column',
+  colRoles: 'roles_column', colBillingCodes: 'billingcodes_column', colContractType: 'contracttype_column',
 };
 
 let parsedRows = [];       // raw time-entry rows as objects, keyed by header
@@ -200,18 +194,51 @@ document.getElementById('fileInput').addEventListener('change', (e) => {
   if (e.target.files[0]) handleFile(e.target.files[0]);
 });
 
-document.getElementById('presetBtn').addEventListener('click', () => {
-  applyColumnMapping(TECHONE_PRESET);
-  const wanted = Object.values(TECHONE_PRESET);
-  const missing = wanted.filter(h => !headers.includes(h));
+// Upload a saved mapping file (.json). Accepts either a bare {..._column: value}
+// object or the infer-style {column_mapping: {...}} wrapper.
+document.getElementById('mappingFileInput').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
   const statusEl = document.getElementById('analyzeStatus');
-  if (missing.length) {
-    statusEl.textContent = `Preset applied — ${missing.length} expected column(s) not found; review step 4.`;
-    statusEl.style.color = 'var(--high)';
-  } else {
-    statusEl.textContent = 'TechOne preset applied — review the mapping below ✓';
-    statusEl.style.color = 'var(--low)';
+  const reader = new FileReader();
+  reader.onload = (ev) => {
+    let mapping;
+    try {
+      const parsed = JSON.parse(ev.target.result);
+      mapping = parsed && parsed.column_mapping ? parsed.column_mapping : parsed;
+    } catch (err) {
+      showError('Could not read mapping file: ' + err.message + ' — expected a .json mapping.');
+      return;
+    }
+    showError('');
+    applyColumnMapping(mapping); // only sets a dropdown when the header exists in this file
+    const wanted = Object.values(MAPPING_FILE_KEYS).map(k => mapping[k]).filter(Boolean);
+    const missing = wanted.filter(h => !headers.includes(h));
+    if (missing.length) {
+      statusEl.textContent = `Mapping loaded — ${missing.length} mapped column(s) not found in this file; review step 4.`;
+      statusEl.style.color = 'var(--high)';
+    } else {
+      statusEl.textContent = 'Mapping loaded — review it below ✓';
+      statusEl.style.color = 'var(--low)';
+    }
+  };
+  reader.readAsText(file);
+});
+
+// Download the current step-4 dropdown selections as a reusable mapping file.
+document.getElementById('downloadMappingBtn').addEventListener('click', () => {
+  const mapping = {};
+  for (const [id, fileKey] of Object.entries(MAPPING_FILE_KEYS)) {
+    mapping[fileKey] = document.getElementById(id).value || null;
   }
+  const json = JSON.stringify({ column_mapping: mapping }, null, 2);
+  const blob = new Blob([json], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'column_mapping.json';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+  showToast('Mapping downloaded (column_mapping.json)');
 });
 
 // --- Ticket-record grouping (time entries -> one record per instance+ticketnumber) ---

@@ -1,0 +1,16 @@
+{
+  "column_mapping": {
+    "instance_column": "all_time_entries[instance]",
+    "ticketnumber_column": "all_time_entries[ticketnumber]",
+    "startdate_column": "all_time_entries[startdatetime]",
+    "summarynotes_column": "all_time_entries[summarynotes]",
+    "internalnotes_column": "all_time_entries[internalnotes]",
+    "kpi_label_column": "all_time_entries[KPI_detail_level01]",
+    "hours_worked_column": "[Sumhoursworked]",
+    "hours_to_bill_column": "[Sumhourstobill]",
+    "nonbillable_column": "all_time_entries[isnonbillable]",
+    "roles_column": "all_roles[name]",
+    "billingcodes_column": "all_billingcodes[name]",
+    "contracttype_column": "all_time_entries[contracttype]"
+  }
+}
