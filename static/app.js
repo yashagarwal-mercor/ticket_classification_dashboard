@@ -1,7 +1,10 @@
 const MODEL = "claude-haiku-4-5";
+const MODEL_SUMMARY = "claude-sonnet-5"; // one-shot quality tasks (theme summary, reconciliation)
 const BATCH_SIZE = 12;      // notes bundles are long (full Dutch email threads) — smaller batches than the old 30
 const CONCURRENCY = 5;
 const CATCHALL_WORKFLOW = "Unclassified / Other";
+const COVERAGE_GAP_THRESHOLD = 0.10; // >10% unclassified triggers a rubric coverage-gap warning (§2.3)
+const THEME_SAMPLE_SIZE = 40;        // # of unclassified notes sampled for theme summarization
 const API_BASE = ""; // same-origin: server.py serves both the page and /api/*
 
 // Time-entry column mapping: select id -> mapping key. The app accepts ONLY the
@@ -30,6 +33,7 @@ let ticketRecords = [];    // canonical ticket records (one per instance+ticketn
 let rubric = [];           // [{name, category, description}]
 let cancelRequested = false;
 let dashboardRows = [];    // [{company, workflow, category, hours, touches, first_touch}]
+let coverageInfo = null;   // {total, unclassified, pct, noNotes, themes:[{theme,description,examples}]} — §2.3 coverage gap
 
 function showError(msg) {
   const el = document.getElementById('errorBanner');
@@ -104,6 +108,7 @@ function handleFile(file) {
 
 function onFileParsed() {
   ticketRecords = [];
+  coverageInfo = null;
   document.getElementById('groupSummary').style.display = 'none';
   document.getElementById('groupStatus').textContent = '';
   document.getElementById('rowCountHint').textContent = `${parsedRows.length.toLocaleString()} time-entry rows detected, ${headers.length} columns.`;
@@ -457,6 +462,8 @@ function buildBatchPrompt(chunk) {
   const workflowList = rubric.map(r => `- ${r.name}: ${r.description}`).join('\n');
   const lines = chunk.map((row, i) => `${i}. ${row.text}`).join('\n');
   const system = `You are classifying helpdesk/support tickets into a fixed set of workflow categories.
+Each ticket is described by its engineer time-entry notes, which are mostly in Dutch (some English).
+Classify based on the meaning of the notes — do NOT translate first, reason over the Dutch directly.
 
 Here are the ${rubric.length} valid workflows:
 ${workflowList}
@@ -510,6 +517,58 @@ async function classifyBatch(chunk, validNames) {
     result.set(item.index, { workflow: wf, confidence: item.confidence });
   }
   return result;
+}
+
+// --- Coverage-gap detection (§2.3): flag when too many tickets fit no workflow ---
+
+function computeCoverage(rows, records) {
+  const total = rows.length;
+  const unclassified = rows.filter(r => r.workflow === CATCHALL_WORKFLOW).length;
+  const noNotes = records.filter(r => !r.has_notes).length;
+  return { total, unclassified, pct: total > 0 ? unclassified / total : 0, noNotes, themes: [] };
+}
+
+const THEME_SCHEMA = {
+  type: "object",
+  properties: {
+    themes: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          theme: { type: "string" },
+          description: { type: "string" },
+          example_ticket_numbers: { type: "array", items: { type: "string" } },
+        },
+        required: ["theme", "description", "example_ticket_numbers"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["themes"],
+  additionalProperties: false,
+};
+
+// Summarize recurring themes among unclassified tickets — candidate new workflows (§2.3).
+// Samples up to THEME_SAMPLE_SIZE unclassified tickets that actually have notes.
+async function summarizeUnclassifiedThemes(records) {
+  const withNotes = records.filter(r => r.workflow === CATCHALL_WORKFLOW && r.has_notes);
+  if (!withNotes.length) return [];
+  const sample = withNotes.slice(0, THEME_SAMPLE_SIZE);
+  const bundles = sample.map(r => `Ticket ${r.ticket_id}: ${r.notes.replace(/\s+/g, ' ').slice(0, 600)}`).join('\n\n');
+  const system = `These support tickets could NOT be matched to any workflow in the rubric. ` +
+    `Identify the recurring themes among them — these are candidate new workflows the rubric is missing. ` +
+    `Notes are mostly Dutch; reason over them directly and write all output in English. ` +
+    `Return 3–8 themes, each with a short English name, a one-sentence description, and 2–3 example ticket numbers drawn only from the input.`;
+  const user = `Unclassified tickets:\n\n${bundles}`;
+  const resp = await fetch(`${API_BASE}/api/classify`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: MODEL_SUMMARY, max_tokens: 2048, system, user, schema: THEME_SCHEMA }),
+  });
+  const body = await resp.json();
+  if (!body.ok) throw new Error(body.error || 'Theme summary failed');
+  return (JSON.parse(body.text).themes) || [];
 }
 
 async function runClassification() {
@@ -588,15 +647,16 @@ async function runClassification() {
 
   await Promise.all(Array.from({ length: CONCURRENCY }, worker));
 
-  document.getElementById('progressWrap').style.display = 'none';
   document.getElementById('classifyBtn').disabled = false;
 
   if (cancelRequested) {
+    document.getElementById('progressWrap').style.display = 'none';
     showError('Classification cancelled.');
     return;
   }
 
   if (hadErrors === chunks.length) {
+    document.getElementById('progressWrap').style.display = 'none';
     showError(`Every batch failed — nothing was classified. First error: ${firstErrorMessage}. Check the server console (running server.py) and try again.`);
     return;
   }
@@ -615,6 +675,20 @@ async function runClassification() {
     }
     return { company: t.company, workflow, category, hours: t.hours, touches: t.touches, first_touch, ticketCount: t.ticketCount };
   });
+
+  // Rubric coverage gap (§2.3): if too many tickets fit no workflow, summarize recurring themes.
+  coverageInfo = computeCoverage(dashboardRows, ticketRecords);
+  if (coverageInfo.pct > COVERAGE_GAP_THRESHOLD) {
+    document.getElementById('progressText').textContent = 'Summarizing recurring themes among unclassified tickets...';
+    try {
+      coverageInfo.themes = await summarizeUnclassifiedThemes(ticketRecords);
+    } catch (err) {
+      console.error('Theme summary failed', err);
+      coverageInfo.themeError = describeError(err);
+    }
+  }
+
+  document.getElementById('progressWrap').style.display = 'none';
 
   if (hadErrors) showError(`${hadErrors} of ${chunks.length} batches failed and were left Unclassified. First error: ${firstErrorMessage}`);
 
@@ -689,7 +763,30 @@ function getFilteredRows() {
   return company === 'all' ? dashboardRows : dashboardRows.filter(r => r.company === company);
 }
 
+// Rubric coverage-gap warning banner (§2.3), shown above the workflow dashboard.
+function renderCoverageBanner() {
+  const el = document.getElementById('coverageBanner');
+  if (!coverageInfo || coverageInfo.pct <= COVERAGE_GAP_THRESHOLD) { el.style.display = 'none'; return; }
+  const pct = (coverageInfo.pct * 100).toFixed(1);
+  const noNotesNote = coverageInfo.noNotes
+    ? ` ${coverageInfo.noNotes.toLocaleString()} ticket(s) had no notes ("no evidence").` : '';
+  let themesHtml = '';
+  if (coverageInfo.themes && coverageInfo.themes.length) {
+    themesHtml = '<div style="margin-top:8px;"><strong>Recurring themes among unclassified tickets (candidate new workflows):</strong><ul style="margin:6px 0 0 18px;">' +
+      coverageInfo.themes.map(t => {
+        const ex = (t.example_ticket_numbers || []).slice(0, 3).map(xmlEscape).join(', ');
+        return `<li><strong>${xmlEscape(t.theme)}</strong> — ${xmlEscape(t.description)}${ex ? ` <span style="color:var(--text-dim);">(e.g. ${ex})</span>` : ''}</li>`;
+      }).join('') + '</ul></div>';
+  } else if (coverageInfo.themeError) {
+    themesHtml = `<div style="margin-top:8px; color:var(--text-dim);">Theme summary unavailable: ${xmlEscape(coverageInfo.themeError)}</div>`;
+  }
+  el.className = 'error-banner';
+  el.style.display = 'block';
+  el.innerHTML = `⚠️ <strong>Rubric coverage gap:</strong> ${coverageInfo.unclassified.toLocaleString()} of ${coverageInfo.total.toLocaleString()} tickets (${pct}%) matched no workflow — above the ${(COVERAGE_GAP_THRESHOLD * 100).toFixed(0)}% threshold.${noNotesNote}${themesHtml}`;
+}
+
 function render() {
+  renderCoverageBanner();
   const filteredRaw = getFilteredRows();
   let agg = aggregateRows(filteredRaw);
 
