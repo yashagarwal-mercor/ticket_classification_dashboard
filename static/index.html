@@ -132,10 +132,19 @@
 
   <div class="panel" id="rubricPanel" style="display:none;">
     <h2><span class="step-label">5</span>Define: Workflow Rubric</h2>
-    <div class="hint" style="margin-bottom:12px;">You define the workflows tickets get classified into. Paste them in bulk below (one per line: <code>Name | Category | Description</code>, Category optional), or build the list row by row in the table. Each ticket is matched to the single best-fitting workflow name; anything that fits none lands in "Unclassified / Other".</div>
+    <div class="hint" style="margin-bottom:12px;">You define the workflows tickets get classified into. Upload a rubric file (e.g. <code>sample_data/techone_workflow_rubric.txt</code>), paste them in bulk below (one per line: <code>Name | Category | Description</code>, Category optional), or build the list row by row in the table. Each ticket is matched to the single best-fitting workflow name; anything that fits none lands in "Unclassified / Other".</div>
+    <div class="field-row" style="align-items:flex-end;">
+      <div class="field" style="flex: 1 1 320px;">
+        <label for="rubricFileInput">Upload a rubric file (.txt / .csv)</label>
+        <input type="file" id="rubricFileInput" accept=".txt,.csv,text/plain">
+      </div>
+      <div class="field" style="flex: 0 0 auto;">
+        <span id="rubricFileStatus" style="font-size:12.5px;"></span>
+      </div>
+    </div>
     <div class="field-row">
       <div class="field" style="flex: 1 1 100%;">
-        <label for="rubricPaste">Enter your workflow rubric — one workflow per line: <code>Name | Category | Description</code> (Category optional)</label>
+        <label for="rubricPaste">…or paste your workflow rubric — one workflow per line: <code>Name | Category | Description</code> (Category optional)</label>
         <textarea id="rubricPaste" placeholder="Password Reset | Identity & Access | Employee-initiated password resets, usually self-service.&#10;MFA Setup | Identity & Access | Enrolling or resetting multi-factor authentication."></textarea>
       </div>
     </div>

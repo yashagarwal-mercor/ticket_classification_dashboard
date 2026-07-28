@@ -378,16 +378,44 @@ function renderRubricTable() {
   });
 }
 
-document.getElementById('parseRubricBtn').addEventListener('click', () => {
-  const text = document.getElementById('rubricPaste').value;
-  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-  const parsed = lines.map(line => {
+// Parse "Name | Category | Description" lines (Category optional) into rubric rows.
+function parseRubricText(text) {
+  return text.split('\n').map(l => l.trim()).filter(Boolean).map(line => {
     const parts = line.split('|').map(p => p.trim());
     if (parts.length >= 3) return { name: parts[0], category: parts[1], description: parts.slice(2).join(' | ') };
     if (parts.length === 2) return { name: parts[0], category: 'General', description: parts[1] };
     return { name: parts[0], category: 'General', description: '' };
   }).filter(r => r.name);
-  if (parsed.length) { rubric = parsed; renderRubricTable(); }
+}
+
+function applyParsedRubric(parsed) {
+  if (!parsed.length) return false;
+  rubric = parsed;
+  renderRubricTable();
+  return true;
+}
+
+document.getElementById('parseRubricBtn').addEventListener('click', () => {
+  applyParsedRubric(parseRubricText(document.getElementById('rubricPaste').value));
+});
+
+// Upload a rubric file (.txt/.csv) — one "Name | Category | Description" per line.
+document.getElementById('rubricFileInput').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const statusEl = document.getElementById('rubricFileStatus');
+  const reader = new FileReader();
+  reader.onload = (ev) => {
+    const parsed = parseRubricText(ev.target.result);
+    if (applyParsedRubric(parsed)) {
+      statusEl.textContent = `Loaded ${parsed.length} workflow${parsed.length === 1 ? '' : 's'} ✓`;
+      statusEl.style.color = 'var(--low)';
+    } else {
+      statusEl.textContent = 'No workflows found — expected "Name | Category | Description" per line.';
+      statusEl.style.color = 'var(--high)';
+    }
+  };
+  reader.readAsText(file);
 });
 
 document.getElementById('addRubricRowBtn').addEventListener('click', () => {
