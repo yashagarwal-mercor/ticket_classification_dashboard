@@ -161,6 +161,10 @@
   <div class="error-banner" id="errorBanner"></div>
 
   <div class="panel" id="classifyPanel" style="display:none;">
+    <div style="margin-bottom:10px;">
+      <label><input type="checkbox" id="useBatch" checked> Run via <strong>Batch API</strong> — async, ~50% cheaper, survives closing the tab (recommended for the full dataset). Uncheck for a fast live run on a small slice.</label>
+      <span id="batchResumeHint" class="hint" style="display:none; margin-left:6px; color:var(--high);"></span>
+    </div>
     <button class="btn" id="classifyBtn">Classify Tickets &amp; Build Dashboard</button>
     <button class="btn secondary" id="nonBillableBtn">View Non-Billable Analysis</button>
     <span class="hint" style="margin-left:6px;">Non-billable analysis needs only grouping — no classification or API calls.</span>

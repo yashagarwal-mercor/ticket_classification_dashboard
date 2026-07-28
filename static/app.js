@@ -121,6 +121,16 @@ function onFileParsed() {
   document.getElementById('classifyPanel').style.display = 'block';
   if (!rubric.length) rubric = [{ name: '', category: 'General', description: '' }];
   renderRubricTable();
+
+  // Surface a pending Batch API run (from a previous session) so the user knows to re-group to resume.
+  const pending = loadBatchState();
+  const hint = document.getElementById('batchResumeHint');
+  if (pending) {
+    hint.textContent = `A classification batch (${pending.batch_id}) is in progress — Group the same file to resume watching it.`;
+    hint.style.display = 'inline';
+  } else {
+    hint.style.display = 'none';
+  }
 }
 
 function populateColumnSelectOptions() {
@@ -356,7 +366,9 @@ function runGrouping() {
   return true;
 }
 
-document.getElementById('groupBtn').addEventListener('click', runGrouping);
+document.getElementById('groupBtn').addEventListener('click', () => {
+  if (runGrouping()) maybeResumeBatch(); // auto-resume a pending batch for this dataset
+});
 
 // --- Rubric table (AI-generated, editable, or replace via bulk paste) ---
 
@@ -458,10 +470,35 @@ function tierFor(frr, aht, touchesPerTicket) {
 
 // --- Classification ---
 
-function buildBatchPrompt(chunk) {
+// Stable guidance appended to the system prompt. Serves two purposes: it improves
+// classification quality, and it keeps the (byte-identical) system prefix above the
+// model's minimum cacheable length (4096 tokens on Haiku) so prompt caching kicks in.
+const CLASSIFY_GUIDELINES = `Classification guidelines:
+- Base your decision on what the engineer actually did, as described in the notes, not only on the label or category tags. The tags are a hint; the notes are the evidence.
+- Choose the workflow whose description best matches the primary activity of the ticket. When several could apply, pick the single dominant one — the activity that consumed the most effort or was the reason the ticket existed.
+- Do not invent, abbreviate, translate, or paraphrase workflow names. Copy the chosen name exactly, character for character, from the list above — including punctuation, capitalization, slashes, and parentheses.
+- Prefer a specific workflow over a generic catch-all when the notes clearly support it. Fall back to a general workflow only when the notes are genuinely generic.
+- Only answer "NONE" when the ticket genuinely does not fit any workflow — not merely because the notes are short, informal, or written in Dutch. A brief note like "wachtwoord gereset" still clearly maps to a workflow.
+
+Reading the notes:
+- Notes are mostly Dutch, sometimes English, and may mix both. Reason over the Dutch directly; do not translate first.
+- A ticket's notes are the concatenation of every time entry on that ticket, in chronological order, separated by "---". Read the whole bundle before deciding — the first entry states the request, later entries show the resolution.
+- Notes may contain quoted email threads, greetings, and signatures ("Goedemiddag", "Met vriendelijke groet"); ignore the pleasantries and focus on the technical action.
+- Common signals: "doorgezet naar" / "doorgestuurd" = escalated/forwarded; "rechten toegekend" = permissions granted; "wachtwoord/MFA/token reset" = credential reset; "TeamViewer"/"remote" = remote session; "printer" = printer work; "backup"/"restore" = backup work; "licentie" = licensing.
+- "Interne uren" (internal hours) tickets are often internal/administrative work rather than a customer request — classify by the actual activity if one fits, else consider whether any workflow genuinely applies.
+
+Choosing confidence:
+- "high" when the notes clearly and unambiguously identify the activity and it maps cleanly to one workflow.
+- "medium" when the mapping is plausible but the notes are partial, ambiguous between two workflows, or you inferred the activity indirectly.
+- "low" when you are guessing from very thin signal (e.g. a one-word note or tags only).
+
+Output rules:
+- Return exactly one classification object per input ticket, using the same index shown before each ticket.
+- The "workflow" value must be either an exact name from the list above or the literal string "NONE". Never output any other value.`;
+
+function buildSystemPrompt() {
   const workflowList = rubric.map(r => `- ${r.name}: ${r.description}`).join('\n');
-  const lines = chunk.map((row, i) => `${i}. ${row.text}`).join('\n');
-  const system = `You are classifying helpdesk/support tickets into a fixed set of workflow categories.
+  return `You are classifying helpdesk/support tickets into a fixed set of workflow categories.
 Each ticket is described by its engineer time-entry notes, which are mostly in Dutch (some English).
 Classify based on the meaning of the notes — do NOT translate first, reason over the Dutch directly.
 
@@ -472,9 +509,18 @@ For each ticket, pick the single best-matching workflow name from the list above
 copied EXACTLY as written. If a ticket genuinely does not fit any of these well,
 respond with the literal string "NONE" instead of forcing a fit.
 
-Rate your confidence in each answer as "high", "medium", or "low".`;
-  const user = `Classify each of these tickets:\n\n${lines}`;
-  return { system, user };
+Rate your confidence in each answer as "high", "medium", or "low".
+
+${CLASSIFY_GUIDELINES}`;
+}
+
+function buildUserPrompt(chunk) {
+  const lines = chunk.map((row, i) => `${i}. ${row.text}`).join('\n');
+  return `Classify each of these tickets:\n\n${lines}`;
+}
+
+function buildBatchPrompt(chunk) {
+  return { system: buildSystemPrompt(), user: buildUserPrompt(chunk) };
 }
 
 const RESPONSE_SCHEMA = {
@@ -571,17 +617,16 @@ async function summarizeUnclassifiedThemes(records) {
   return (JSON.parse(body.text).themes) || [];
 }
 
-async function runClassification() {
-  cancelRequested = false;
-  showError('');
+function describeError(err) {
+  return (err && err.message) ? err.message : String(err);
+}
 
-  if (!rubric.length) { showError('Add at least one workflow to the rubric.'); return; }
-  if (!parsedRows.length) { showError('Upload a time-entry export first.'); return; }
-  if (!ticketRecords.length && !runGrouping()) return; // group first (also validates required columns)
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-  // Classify the grouped ticket records. The classification signal is the concatenated
-  // engineer notes (mostly Dutch), prefixed with the label/contract tags for extra context.
-  const tickets = ticketRecords.map(rec => {
+// Build the per-ticket classification inputs from the grouped records. The signal is
+// the concatenated notes (mostly Dutch) prefixed with label/contract tags.
+function buildTicketsForClassification() {
+  return ticketRecords.map(rec => {
     const tags = [
       rec.labels.length ? `Labels: ${rec.labels.join(', ')}` : '',
       rec.contract_types.length ? `Contract: ${rec.contract_types.join(', ')}` : '',
@@ -597,43 +642,74 @@ async function runClassification() {
       record: rec,
     };
   });
+}
 
-  const validNames = new Set(rubric.map(r => r.name));
-
+function chunkTickets(tickets) {
   const chunks = [];
   for (let i = 0; i < tickets.length; i += BATCH_SIZE) chunks.push(tickets.slice(i, i + BATCH_SIZE));
+  return chunks;
+}
 
+// Shared post-classification step for both the in-browser and Batch API paths:
+// build dashboardRows, run the coverage-gap themes (§2.3), and show the dashboard.
+async function finalizeClassification(tickets, classifications) {
+  const catByName = new Map(rubric.map(r => [r.name, r.category || 'General']));
+  dashboardRows = tickets.map((t, i) => {
+    const c = classifications[i];
+    const workflow = (c && c.workflow && c.workflow !== 'NONE') ? c.workflow : CATCHALL_WORKFLOW;
+    const category = catByName.get(workflow) || 'Other';
+    if (t.record) { t.record.workflow = workflow; t.record.category = category; } // keep the non-billable pivot workflow-aware
+    let first_touch;
+    if (t.firstTouchResolved != null) first_touch = t.firstTouchResolved;
+    else first_touch = (t.ticketCount <= 1 && t.touches === 1) ? 1 : 0;
+    return { company: t.company, workflow, category, hours: t.hours, touches: t.touches, first_touch, ticketCount: t.ticketCount };
+  });
+
+  coverageInfo = computeCoverage(dashboardRows, ticketRecords);
+  if (coverageInfo.pct > COVERAGE_GAP_THRESHOLD) {
+    document.getElementById('progressText').textContent = 'Summarizing recurring themes among unclassified tickets...';
+    try {
+      coverageInfo.themes = await summarizeUnclassifiedThemes(ticketRecords);
+    } catch (err) {
+      console.error('Theme summary failed', err);
+      coverageInfo.themeError = describeError(err);
+    }
+  }
+  showDashboard();
+}
+
+// In-browser classification (live, progressive). Best for small slices — the browser
+// caps concurrent connections, so the full dataset should use the Batch API path below.
+async function runClassification() {
+  cancelRequested = false;
+  showError('');
+  if (!rubric.length) { showError('Add at least one workflow to the rubric.'); return; }
+  if (!parsedRows.length) { showError('Upload a time-entry export first.'); return; }
+  if (!ticketRecords.length && !runGrouping()) return;
+
+  const tickets = buildTicketsForClassification();
+  const validNames = new Set(rubric.map(r => r.name));
+  const chunks = chunkTickets(tickets);
   const classifications = new Array(tickets.length).fill(null);
-  let completed = 0;
+  let completed = 0, chunkIdx = 0, hadErrors = 0, firstErrorMessage = null;
 
   document.getElementById('progressWrap').style.display = 'block';
   document.getElementById('classifyBtn').disabled = true;
-
   const updateProgress = () => {
     const pct = Math.round((completed / chunks.length) * 100);
     document.getElementById('progressBarInner').style.width = pct + '%';
     document.getElementById('progressText').textContent =
-      `Classifying batch ${completed} of ${chunks.length} (${tickets.length.toLocaleString()} rows total)...`;
+      `Classifying batch ${completed} of ${chunks.length} (${tickets.length.toLocaleString()} tickets total)...`;
   };
   updateProgress();
-
-  let chunkIdx = 0;
-  let hadErrors = 0;
-  let firstErrorMessage = null;
-
-  function describeError(err) {
-    if (err && err.message) return err.message;
-    return String(err);
-  }
 
   async function worker() {
     while (chunkIdx < chunks.length) {
       if (cancelRequested) return;
       const myIdx = chunkIdx++;
-      const chunk = chunks[myIdx];
       const offset = myIdx * BATCH_SIZE;
       try {
-        const result = await classifyBatch(chunk, validNames);
+        const result = await classifyBatch(chunks[myIdx], validNames);
         for (const [i, val] of result.entries()) classifications[offset + i] = val;
       } catch (err) {
         hadErrors++;
@@ -646,7 +722,6 @@ async function runClassification() {
   }
 
   await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-
   document.getElementById('classifyBtn').disabled = false;
 
   if (cancelRequested) {
@@ -654,48 +729,158 @@ async function runClassification() {
     showError('Classification cancelled.');
     return;
   }
-
   if (hadErrors === chunks.length) {
     document.getElementById('progressWrap').style.display = 'none';
     showError(`Every batch failed — nothing was classified. First error: ${firstErrorMessage}. Check the server console (running server.py) and try again.`);
     return;
   }
+  if (hadErrors) showError(`${hadErrors} of ${chunks.length} batches failed and were left Unclassified. First error: ${firstErrorMessage}`);
 
-  const catByName = new Map(rubric.map(r => [r.name, r.category || 'General']));
-  dashboardRows = tickets.map((t, i) => {
-    const c = classifications[i];
-    const workflow = (c && c.workflow && c.workflow !== 'NONE') ? c.workflow : CATCHALL_WORKFLOW;
-    const category = catByName.get(workflow) || 'Other';
-    if (t.record) { t.record.workflow = workflow; t.record.category = category; } // let the non-billable pivot be workflow-aware
-    let first_touch;
-    if (t.firstTouchResolved != null) {
-      first_touch = t.firstTouchResolved;
-    } else {
-      first_touch = (t.ticketCount <= 1 && t.touches === 1) ? 1 : 0;
+  await finalizeClassification(tickets, classifications);
+  document.getElementById('progressWrap').style.display = 'none';
+}
+
+// --- Batch API classification (async, ~50% cheaper, survives a closed tab) ---
+
+const BATCH_LS_KEY = 'ent1998_pending_batch';
+function datasetFingerprint() { return `${ticketRecords.length}:${parsedRows.length}:${headers.length}`; }
+function saveBatchState(batchId) {
+  try { localStorage.setItem(BATCH_LS_KEY, JSON.stringify({ batch_id: batchId, fingerprint: datasetFingerprint() })); } catch (e) {}
+}
+function loadBatchState() { try { return JSON.parse(localStorage.getItem(BATCH_LS_KEY) || 'null'); } catch (e) { return null; } }
+function clearBatchState() { try { localStorage.removeItem(BATCH_LS_KEY); } catch (e) {} }
+
+async function runBatchClassification() {
+  cancelRequested = false;
+  showError('');
+  if (!rubric.length) { showError('Add at least one workflow to the rubric.'); return; }
+  if (!parsedRows.length) { showError('Upload a time-entry export first.'); return; }
+  if (!ticketRecords.length && !runGrouping()) return;
+
+  const tickets = buildTicketsForClassification();
+  const chunks = chunkTickets(tickets);
+  const requests = chunks.map((chunk, i) => ({ custom_id: `c${i}`, user: buildUserPrompt(chunk) }));
+
+  document.getElementById('classifyBtn').disabled = true;
+  document.getElementById('progressWrap').style.display = 'block';
+  document.getElementById('progressBarInner').style.width = '0%';
+  document.getElementById('progressText').textContent =
+    `Submitting ${requests.length.toLocaleString()} requests to the Batch API...`;
+
+  let batchId;
+  try {
+    const resp = await fetch(`${API_BASE}/api/batch/create`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: MODEL, max_tokens: 4096, system: buildSystemPrompt(), schema: RESPONSE_SCHEMA, requests }),
+    });
+    const body = await resp.json();
+    if (!body.ok) throw new Error(body.error || 'Batch create failed');
+    batchId = body.batch_id;
+  } catch (err) {
+    document.getElementById('progressWrap').style.display = 'none';
+    document.getElementById('classifyBtn').disabled = false;
+    showError('Could not start the batch: ' + describeError(err));
+    return;
+  }
+  saveBatchState(batchId);
+  await pollBatchToCompletion(batchId, tickets, chunks);
+}
+
+// Poll a batch to completion, then map results back by custom_id and finalize.
+// Reused by the resume path after a page reload.
+async function pollBatchToCompletion(batchId, tickets, chunks) {
+  const validNames = new Set(rubric.map(r => r.name));
+  const total = chunks.length;
+  const bar = document.getElementById('progressBarInner');
+  const text = document.getElementById('progressText');
+  document.getElementById('progressWrap').style.display = 'block';
+  document.getElementById('classifyBtn').disabled = true;
+
+  while (true) {
+    if (cancelRequested) {
+      document.getElementById('progressWrap').style.display = 'none';
+      document.getElementById('classifyBtn').disabled = false;
+      showError('Stopped watching the batch — it keeps running on Anthropic. Re-group the same file to resume.');
+      return;
     }
-    return { company: t.company, workflow, category, hours: t.hours, touches: t.touches, first_touch, ticketCount: t.ticketCount };
-  });
-
-  // Rubric coverage gap (§2.3): if too many tickets fit no workflow, summarize recurring themes.
-  coverageInfo = computeCoverage(dashboardRows, ticketRecords);
-  if (coverageInfo.pct > COVERAGE_GAP_THRESHOLD) {
-    document.getElementById('progressText').textContent = 'Summarizing recurring themes among unclassified tickets...';
+    let status;
     try {
-      coverageInfo.themes = await summarizeUnclassifiedThemes(ticketRecords);
-    } catch (err) {
-      console.error('Theme summary failed', err);
-      coverageInfo.themeError = describeError(err);
+      const resp = await fetch(`${API_BASE}/api/batch/status?id=${encodeURIComponent(batchId)}`);
+      status = await resp.json();
+    } catch (err) { status = { ok: false, error: describeError(err) }; }
+
+    if (status.ok) {
+      const c = status.request_counts || {};
+      const done = (c.succeeded || 0) + (c.errored || 0) + (c.canceled || 0) + (c.expired || 0);
+      const pct = total > 0 ? Math.round(done / total * 100) : 0;
+      bar.style.width = pct + '%';
+      text.textContent = `Batch classifying: ${done.toLocaleString()} / ${total.toLocaleString()} requests (${pct}%) — ${status.processing_status}. Safe to close the tab.`;
+      if (status.processing_status === 'ended') break;
+      if (status.processing_status === 'canceled' || status.processing_status === 'expired') {
+        document.getElementById('progressWrap').style.display = 'none';
+        document.getElementById('classifyBtn').disabled = false;
+        clearBatchState();
+        showError(`Batch ${status.processing_status}. Try again.`);
+        return;
+      }
+    } else {
+      text.textContent = `Batch status check failed (${status.error || 'unknown'}) — retrying...`;
+    }
+    await sleep(5000);
+  }
+
+  text.textContent = 'Batch complete — downloading results...';
+  let body;
+  try {
+    const resp = await fetch(`${API_BASE}/api/batch/results?id=${encodeURIComponent(batchId)}`);
+    body = await resp.json();
+    if (!body.ok) throw new Error(body.error || 'Batch results failed');
+  } catch (err) {
+    document.getElementById('progressWrap').style.display = 'none';
+    document.getElementById('classifyBtn').disabled = false;
+    showError('Could not download batch results: ' + describeError(err));
+    return;
+  }
+  if (body.usage) console.log('Batch cache usage:', body.usage);
+
+  const classifications = new Array(tickets.length).fill(null);
+  for (const r of body.results || []) {
+    const m = /^c(\d+)$/.exec(r.custom_id || '');
+    if (!m) continue;
+    const chunkIdx = +m[1];
+    const chunk = chunks[chunkIdx];
+    if (!chunk || !r.ok) continue;
+    const offset = chunkIdx * BATCH_SIZE;
+    let parsed;
+    try { parsed = JSON.parse(r.text); } catch (e) { continue; }
+    for (const item of parsed.classifications || []) {
+      if (item.index == null || item.index >= chunk.length) continue;
+      let wf = item.workflow;
+      if (wf !== 'NONE' && !validNames.has(wf)) wf = 'NONE';
+      classifications[offset + item.index] = { workflow: wf, confidence: item.confidence };
     }
   }
 
+  clearBatchState();
+  await finalizeClassification(tickets, classifications);
   document.getElementById('progressWrap').style.display = 'none';
-
-  if (hadErrors) showError(`${hadErrors} of ${chunks.length} batches failed and were left Unclassified. First error: ${firstErrorMessage}`);
-
-  showDashboard();
+  document.getElementById('classifyBtn').disabled = false;
 }
 
-document.getElementById('classifyBtn').addEventListener('click', runClassification);
+// If a batch is pending for the currently-grouped dataset, resume watching it.
+function maybeResumeBatch() {
+  const st = loadBatchState();
+  if (!st || st.fingerprint !== datasetFingerprint()) return false;
+  showError('');
+  const tickets = buildTicketsForClassification();
+  pollBatchToCompletion(st.batch_id, tickets, chunkTickets(tickets));
+  return true;
+}
+
+document.getElementById('classifyBtn').addEventListener('click', () => {
+  if (document.getElementById('useBatch').checked) runBatchClassification();
+  else runClassification();
+});
 document.getElementById('cancelBtn').addEventListener('click', () => { cancelRequested = true; });
 
 document.getElementById('startOverBtn').addEventListener('click', () => {

@@ -28,9 +28,13 @@ Then open http://localhost:8787
 
 import json
 import os
+import re
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
 
 import anthropic
+from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
+from anthropic.types.messages.batch_create_params import Request
 
 PORT = 8787
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -41,6 +45,10 @@ if not os.environ.get("ANTHROPIC_API_KEY"):
 client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
 
 INFER_MODEL = "claude-opus-4-8"
+
+# Anthropic batch ids look like "msgbatch_...". Validate before passing a
+# client-supplied id to the SDK (guards against parameter injection).
+BATCH_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 _MAPPING_FIELDS = [
     "instance_column", "ticketnumber_column", "startdate_column",
@@ -80,6 +88,14 @@ INFER_SYSTEM_PROMPT = """You are setting up an IT/MSP helpdesk analysis tool fro
    Map instance_column, ticketnumber_column, startdate_column, summarynotes_column, and hours_worked_column whenever any plausible column exists -- these are required downstream."""
 
 
+def _cached_system(system_text):
+    """Wrap a system prompt string as a cache_control'd text block so the
+    repeated rubric prefix is served from cache (~0.1x) across requests.
+    Caching only kicks in above the model's minimum prefix (4096 tokens on
+    Haiku) -- the frontend pads the rubric prompt to clear that floor."""
+    return [{"type": "text", "text": system_text, "cache_control": {"type": "ephemeral"}}]
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=STATIC_DIR, **kwargs)
@@ -104,8 +120,19 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        if self.path == "/api/health":
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/health":
             self._send_json(200, {"ok": True})
+            return
+        if parsed.path in ("/api/batch/status", "/api/batch/results"):
+            batch_id = (parse_qs(parsed.query).get("id") or [""])[0]
+            if not BATCH_ID_RE.match(batch_id):
+                self._send_json(200, {"ok": False, "error": "invalid batch id"})
+                return
+            if parsed.path == "/api/batch/status":
+                self._handle_batch_status(batch_id)
+            else:
+                self._handle_batch_results(batch_id)
             return
         super().do_GET()
 
@@ -114,6 +141,8 @@ class Handler(SimpleHTTPRequestHandler):
             self._handle_infer()
         elif self.path == "/api/classify":
             self._handle_classify()
+        elif self.path == "/api/batch/create":
+            self._handle_batch_create()
         else:
             self._send_json(404, {"ok": False, "error": "not found"})
 
@@ -148,12 +177,84 @@ class Handler(SimpleHTTPRequestHandler):
             response = client.messages.create(
                 model=body["model"],
                 max_tokens=body.get("max_tokens", 4096),
-                system=body["system"],
+                system=_cached_system(body["system"]),  # cache_control on the repeated rubric prefix
                 messages=[{"role": "user", "content": body["user"]}],
                 output_config={"format": {"type": "json_schema", "schema": body["schema"]}},
             )
             text_block = next(b for b in response.content if b.type == "text")
             self._send_json(200, {"ok": True, "text": text_block.text})
+        except Exception as e:
+            self._send_json(200, {"ok": False, "error": str(e)})
+
+    # --- Batch API relay (proxies the Anthropic Message Batches API by id) ---
+
+    def _handle_batch_create(self):
+        try:
+            body = self._read_body()
+            model = body["model"]
+            max_tokens = body.get("max_tokens", 4096)
+            system = _cached_system(body["system"])  # shared, cached prefix across all requests
+            schema = body["schema"]
+            requests = [
+                Request(
+                    custom_id=r["custom_id"],
+                    params=MessageCreateParamsNonStreaming(
+                        model=model,
+                        max_tokens=max_tokens,
+                        system=system,
+                        messages=[{"role": "user", "content": r["user"]}],
+                        output_config={"format": {"type": "json_schema", "schema": schema}},
+                    ),
+                )
+                for r in body["requests"]
+            ]
+            batch = client.messages.batches.create(requests=requests)
+            self._send_json(200, {"ok": True, "batch_id": batch.id, "processing_status": batch.processing_status})
+        except Exception as e:
+            self._send_json(200, {"ok": False, "error": str(e)})
+
+    def _handle_batch_status(self, batch_id):
+        try:
+            b = client.messages.batches.retrieve(batch_id)
+            c = b.request_counts
+            self._send_json(200, {
+                "ok": True,
+                "processing_status": b.processing_status,
+                "request_counts": {
+                    "processing": c.processing, "succeeded": c.succeeded,
+                    "errored": c.errored, "canceled": c.canceled, "expired": c.expired,
+                },
+            })
+        except Exception as e:
+            self._send_json(200, {"ok": False, "error": str(e)})
+
+    def _handle_batch_results(self, batch_id):
+        try:
+            b = client.messages.batches.retrieve(batch_id)
+            if b.processing_status != "ended":
+                self._send_json(200, {"ok": False, "error": "batch not ended", "processing_status": b.processing_status})
+                return
+            results, cache_read, cache_creation = [], 0, 0
+            for r in client.messages.batches.results(batch_id):
+                rtype = r.result.type
+                if rtype == "succeeded":
+                    msg = r.result.message
+                    text = next((blk.text for blk in msg.content if blk.type == "text"), "")
+                    cache_read += getattr(msg.usage, "cache_read_input_tokens", 0) or 0
+                    cache_creation += getattr(msg.usage, "cache_creation_input_tokens", 0) or 0
+                    results.append({"custom_id": r.custom_id, "ok": True, "text": text})
+                else:
+                    err = rtype
+                    try:
+                        err = r.result.error.type
+                    except Exception:
+                        pass
+                    results.append({"custom_id": r.custom_id, "ok": False, "error": str(err)})
+            self._send_json(200, {
+                "ok": True,
+                "results": results,
+                "usage": {"cache_read_input_tokens": cache_read, "cache_creation_input_tokens": cache_creation},
+            })
         except Exception as e:
             self._send_json(200, {"ok": False, "error": str(e)})
 
