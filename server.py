@@ -42,23 +42,20 @@ client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
 
 INFER_MODEL = "claude-opus-4-8"
 
+_MAPPING_FIELDS = [
+    "instance_column", "ticketnumber_column", "startdate_column",
+    "summarynotes_column", "internalnotes_column", "kpi_label_column",
+    "hours_worked_column", "hours_to_bill_column", "nonbillable_column",
+    "roles_column", "billingcodes_column", "contracttype_column",
+]
+
 INFER_SCHEMA = {
     "type": "object",
     "properties": {
         "column_mapping": {
             "type": "object",
-            "properties": {
-                "company_column": {"type": ["string", "null"]},
-                "text_columns": {"type": "array", "items": {"type": "string"}},
-                "hours_column": {"type": ["string", "null"]},
-                "touches_column": {"type": ["string", "null"]},
-                "first_resolution_column": {"type": ["string", "null"]},
-                "ticket_count_column": {"type": ["string", "null"]},
-            },
-            "required": [
-                "company_column", "text_columns", "hours_column",
-                "touches_column", "first_resolution_column", "ticket_count_column",
-            ],
+            "properties": {f: {"type": ["string", "null"]} for f in _MAPPING_FIELDS},
+            "required": _MAPPING_FIELDS,
             "additionalProperties": False,
         },
     },
@@ -66,16 +63,21 @@ INFER_SCHEMA = {
     "additionalProperties": False,
 }
 
-INFER_SYSTEM_PROMPT = """You are setting up an IT/MSP helpdesk ticket classification tool from a raw spreadsheet export. You'll be given the column headers and a sample of rows.
+INFER_SYSTEM_PROMPT = """You are setting up an IT/MSP helpdesk analysis tool from a raw TIME-ENTRY export (one row per time entry logged against a ticket; many rows roll up to one ticket). You'll be given the column headers and a sample of rows. Map each field to the single best-matching column header, or null if truly absent. Return the header string EXACTLY as given.
 
-Identify the COLUMN MAPPING:
-   - company_column: a column identifying the customer/company/account this row belongs to, if one exists (else null).
-   - text_columns: the column(s) that carry the actual classification signal for what the ticket is about. If there's a single free-text description/title/summary column, use just that one. If there is NO free-text column but there are structured tag columns instead (e.g. IssueType + SubIssueType, or Category + Subcategory), list ALL of them in the order they should be combined -- these will be concatenated per row to form the classification input.
-   - hours_column: total hours spent, if present.
-   - touches_column: number of touches/interactions/time-entries, if present.
-   - first_resolution_column: a column indicating first-touch resolution, if present -- this might be a boolean/yes-no flag (one row = one ticket) OR a count (one row represents many tickets, e.g. "CountFirstResolution" alongside a ticket-count column). Either shape is fine, just identify the column.
-   - ticket_count_column: if this data is PRE-AGGREGATED (i.e. each row represents a group of N tickets sharing the same tags/company/period, rather than one row = one ticket), identify the column holding that count (e.g. "TicketCount"). If each row is one individual ticket, set this to null.
-   Only map hours_column/touches_column to null if truly absent -- these are usually present under some name (SumHours, TotalHours, Hours, Duration, SumTouches, Touches, InteractionCount, etc)."""
+   - instance_column: the customer/company/account/instance this entry belongs to (e.g. "datavisual", "hupra"). Often named all_time_entries[instance].
+   - ticketnumber_column: the ticket identifier that groups entries into one ticket (e.g. all_time_entries[ticketnumber], a value like "T20260112.0024"). Prefer the human ticket number over an internal row id.
+   - startdate_column: the start date/time of the entry, used to order notes chronologically (e.g. all_time_entries[startdatetime]).
+   - summarynotes_column: the primary free-text engineer note (mostly Dutch). Often all_time_entries[summarynotes].
+   - internalnotes_column: a secondary/internal free-text note, if present (often all_time_entries[internalnotes]); null if absent.
+   - kpi_label_column: a level-1 label/KPI category (e.g. all_time_entries[KPI_detail_level01], values like "Klant tickets" / "Interne uren"); null if absent.
+   - hours_worked_column: hours worked per entry (e.g. [Sumhoursworked]).
+   - hours_to_bill_column: billable hours per entry (e.g. [Sumhourstobill]); null if absent.
+   - nonbillable_column: a TRUE/FALSE (or yes/no) flag marking the entry non-billable (e.g. all_time_entries[isnonbillable]); null if absent.
+   - roles_column: the engineer role/team (e.g. all_roles[name], values like "Eerstelijns Service Engineer"); null if absent.
+   - billingcodes_column: the billing code (e.g. all_billingcodes[name], values like "Support remote"); null if absent.
+   - contracttype_column: the contract type (e.g. all_time_entries[contracttype], values like "Strippenkaart", "Servicecontract"); null if absent.
+   Map instance_column, ticketnumber_column, startdate_column, summarynotes_column, and hours_worked_column whenever any plausible column exists -- these are required downstream."""
 
 
 class Handler(SimpleHTTPRequestHandler):

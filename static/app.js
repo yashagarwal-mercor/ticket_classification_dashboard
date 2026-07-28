@@ -1,11 +1,38 @@
 const MODEL = "claude-haiku-4-5";
-const BATCH_SIZE = 30;
+const BATCH_SIZE = 12;      // notes bundles are long (full Dutch email threads) — smaller batches than the old 30
 const CONCURRENCY = 5;
 const CATCHALL_WORKFLOW = "Unclassified / Other";
 const API_BASE = ""; // same-origin: server.py serves both the page and /api/*
 
-let parsedRows = [];       // raw spreadsheet rows as objects, keyed by header
+// Time-entry column mapping: select id -> mapping key. The app accepts ONLY the
+// one-row-per-time-entry format; rows are grouped into ticket records before anything else.
+const COL_SELECTS = {
+  colInstance: 'instance', colTicketNumber: 'ticketnumber', colStartDate: 'startdate',
+  colSummaryNotes: 'summarynotes', colInternalNotes: 'internalnotes', colKpiLabel: 'kpiLabel',
+  colHoursWorked: 'hoursWorked', colHoursToBill: 'hoursToBill', colNonBillable: 'nonbillable',
+  colRoles: 'roles', colBillingCodes: 'billingcodes', colContractType: 'contracttype',
+};
+const REQUIRED_COLS = ['instance', 'ticketnumber', 'startdate', 'summarynotes', 'hoursWorked'];
+
+// One-click mapping for a standard TechOne time-entry export (exact header names).
+const TECHONE_PRESET = {
+  instance_column: 'all_time_entries[instance]',
+  ticketnumber_column: 'all_time_entries[ticketnumber]',
+  startdate_column: 'all_time_entries[startdatetime]',
+  summarynotes_column: 'all_time_entries[summarynotes]',
+  internalnotes_column: 'all_time_entries[internalnotes]',
+  kpi_label_column: 'all_time_entries[KPI_detail_level01]',
+  hours_worked_column: '[Sumhoursworked]',
+  hours_to_bill_column: '[Sumhourstobill]',
+  nonbillable_column: 'all_time_entries[isnonbillable]',
+  roles_column: 'all_roles[name]',
+  billingcodes_column: 'all_billingcodes[name]',
+  contracttype_column: 'all_time_entries[contracttype]',
+};
+
+let parsedRows = [];       // raw time-entry rows as objects, keyed by header
 let headers = [];
+let ticketRecords = [];    // canonical ticket records (one per instance+ticketnumber) — see groupTimeEntriesIntoTickets
 let rubric = [];           // [{name, category, description}]
 let cancelRequested = false;
 let dashboardRows = [];    // [{company, workflow, category, hours, touches, first_touch}]
@@ -82,7 +109,10 @@ function handleFile(file) {
 }
 
 function onFileParsed() {
-  document.getElementById('rowCountHint').textContent = `${parsedRows.length.toLocaleString()} rows detected, ${headers.length} columns.`;
+  ticketRecords = [];
+  document.getElementById('groupSummary').style.display = 'none';
+  document.getElementById('groupStatus').textContent = '';
+  document.getElementById('rowCountHint').textContent = `${parsedRows.length.toLocaleString()} time-entry rows detected, ${headers.length} columns.`;
   populateColumnSelectOptions();
   // Everything is visible up front: the column mapping (optionally auto-filled
   // by AI), the user-authored workflow rubric, and the classify button.
@@ -95,17 +125,11 @@ function onFileParsed() {
 }
 
 function populateColumnSelectOptions() {
-  const optionalSelects = ['colCompany', 'colFirstRes', 'colTicketCount'];
-  const requiredSelects = ['colHours', 'colTouches'];
-  [...optionalSelects, ...requiredSelects].forEach(id => {
-    const sel = document.getElementById(id);
-    sel.innerHTML = (optionalSelects.includes(id) ? '<option value="">(none)</option>' : '') +
-      headers.map(h => `<option value="${h}">${h}</option>`).join('');
+  const optionsHtml = '<option value="">(none)</option>' +
+    headers.map(h => `<option value="${escapeAttr(h)}">${xmlEscape(h)}</option>`).join('');
+  Object.keys(COL_SELECTS).forEach(id => {
+    document.getElementById(id).innerHTML = optionsHtml;
   });
-  const checklist = document.getElementById('textColsChecklist');
-  checklist.innerHTML = headers.map(h => `
-    <label><input type="checkbox" value="${escapeAttr(h)}" class="text-col-check"> ${h}</label>
-  `).join('');
 }
 
 function escapeAttr(s) {
@@ -150,22 +174,157 @@ function applyColumnMapping(mapping) {
     const sel = document.getElementById(id);
     if (value && [...sel.options].some(o => o.value === value)) sel.value = value;
   };
-  setIfPresent('colCompany', mapping.company_column);
-  setIfPresent('colHours', mapping.hours_column);
-  setIfPresent('colTouches', mapping.touches_column);
-  setIfPresent('colFirstRes', mapping.first_resolution_column);
-  setIfPresent('colTicketCount', mapping.ticket_count_column);
+  setIfPresent('colInstance', mapping.instance_column);
+  setIfPresent('colTicketNumber', mapping.ticketnumber_column);
+  setIfPresent('colStartDate', mapping.startdate_column);
+  setIfPresent('colSummaryNotes', mapping.summarynotes_column);
+  setIfPresent('colInternalNotes', mapping.internalnotes_column);
+  setIfPresent('colKpiLabel', mapping.kpi_label_column);
+  setIfPresent('colHoursWorked', mapping.hours_worked_column);
+  setIfPresent('colHoursToBill', mapping.hours_to_bill_column);
+  setIfPresent('colNonBillable', mapping.nonbillable_column);
+  setIfPresent('colRoles', mapping.roles_column);
+  setIfPresent('colBillingCodes', mapping.billingcodes_column);
+  setIfPresent('colContractType', mapping.contracttype_column);
+}
 
-  const textCols = new Set(mapping.text_columns || []);
-  document.querySelectorAll('.text-col-check').forEach(cb => {
-    cb.checked = textCols.has(cb.value);
-  });
+// Read current dropdown selections into a mapping keyed by the short names groupTimeEntriesIntoTickets expects.
+function getColumnMapping() {
+  const m = {};
+  for (const [id, key] of Object.entries(COL_SELECTS)) m[key] = document.getElementById(id).value;
+  return m;
 }
 
 document.getElementById('analyzeBtn').addEventListener('click', runAnalyze);
 document.getElementById('fileInput').addEventListener('change', (e) => {
   if (e.target.files[0]) handleFile(e.target.files[0]);
 });
+
+document.getElementById('presetBtn').addEventListener('click', () => {
+  applyColumnMapping(TECHONE_PRESET);
+  const wanted = Object.values(TECHONE_PRESET);
+  const missing = wanted.filter(h => !headers.includes(h));
+  const statusEl = document.getElementById('analyzeStatus');
+  if (missing.length) {
+    statusEl.textContent = `Preset applied — ${missing.length} expected column(s) not found; review step 4.`;
+    statusEl.style.color = 'var(--high)';
+  } else {
+    statusEl.textContent = 'TechOne preset applied — review the mapping below ✓';
+    statusEl.style.color = 'var(--low)';
+  }
+});
+
+// --- Ticket-record grouping (time entries -> one record per instance+ticketnumber) ---
+
+// Parse the export's date format explicitly. The Autotask export uses US M/D/YYYY
+// (optionally with time), which Date.parse handles inconsistently across engines/locales —
+// so we parse it directly and only fall back to Date.parse for other shapes.
+function parseEntryDate(s) {
+  if (!s) return NaN;
+  const str = String(s).trim();
+  const m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?/);
+  if (m) return new Date(+m[3], +m[1] - 1, +m[2], +(m[4] || 0), +(m[5] || 0), +(m[6] || 0)).getTime();
+  const t = Date.parse(str);
+  return isNaN(t) ? NaN : t;
+}
+
+// Canonical ticket record (ENT-1998 §4 Stage 1). Groups many time-entry rows into one
+// ticket keyed by instance + ticketnumber (ticketnumber alone collides across companies).
+function groupTimeEntriesIntoTickets(rows, m) {
+  const byKey = new Map();
+  const val = (r, key) => (m[key] ? String(r[m[key]] ?? '').trim() : '');
+  for (const r of rows) {
+    const instance = val(r, 'instance');
+    const tn = val(r, 'ticketnumber');
+    if (!instance && !tn) continue; // skip blank rows
+    const key = JSON.stringify([instance, tn]); // collision-safe compound key
+    let rec = byKey.get(key);
+    if (!rec) { rec = { ticket_id: tn, company: instance || 'Unknown', entries: [] }; byKey.set(key, rec); }
+    rec.entries.push({
+      start: val(r, 'startdate'),
+      summary: val(r, 'summarynotes'),
+      internal: val(r, 'internalnotes'),
+      hoursWorked: m.hoursWorked ? (parseFloat(r[m.hoursWorked]) || 0) : 0,
+      hoursToBill: m.hoursToBill ? (parseFloat(r[m.hoursToBill]) || 0) : 0,
+      nonbillable: m.nonbillable ? (parseBoolish(r[m.nonbillable]) === 1) : false,
+      role: val(r, 'roles'),
+      billingCode: val(r, 'billingcodes'),
+      kpi: val(r, 'kpiLabel'),
+      contract: val(r, 'contracttype'),
+    });
+  }
+  const distinct = arr => Array.from(new Set(arr.filter(Boolean)));
+  const records = [];
+  for (const rec of byKey.values()) {
+    const entries = rec.entries.slice().sort((a, b) => {
+      const da = parseEntryDate(a.start), db = parseEntryDate(b.start);
+      if (isNaN(da) && isNaN(db)) return 0;
+      if (isNaN(da)) return 1;
+      if (isNaN(db)) return -1;
+      return da - db;
+    });
+    const noteParts = [];
+    for (const e of entries) { if (e.summary) noteParts.push(e.summary); if (e.internal) noteParts.push(e.internal); }
+    const nbCount = entries.filter(e => e.nonbillable).length;
+    let nonbillable_flag = 'none';
+    if (nbCount > 0) nonbillable_flag = (nbCount === entries.length) ? 'fully' : 'partial';
+    records.push({
+      ticket_id: rec.ticket_id,
+      company: rec.company,
+      notes: noteParts.join('\n---\n'),
+      hours: entries.reduce((s, e) => s + e.hoursWorked, 0),
+      hours_to_bill: entries.reduce((s, e) => s + e.hoursToBill, 0),
+      touches: entries.length,
+      roles: distinct(entries.map(e => e.role)),
+      billing_codes: distinct(entries.map(e => e.billingCode)),
+      labels: distinct(entries.map(e => e.kpi)),
+      contract_types: distinct(entries.map(e => e.contract)),
+      nonbillable_hours: entries.reduce((s, e) => s + (e.nonbillable ? e.hoursWorked : 0), 0),
+      nonbillable_flag,
+      has_notes: noteParts.length > 0,
+    });
+  }
+  return records;
+}
+
+// Validate required mapping, run grouping, store ticketRecords, and show a summary.
+// Returns true on success. Both classification and non-billable analysis depend on this.
+function runGrouping() {
+  const m = getColumnMapping();
+  const missing = REQUIRED_COLS.filter(k => !m[k]);
+  if (missing.length) {
+    const labels = { instance: 'Company/instance', ticketnumber: 'Ticket number', startdate: 'Start date/time', summarynotes: 'Summary notes', hoursWorked: 'Hours worked' };
+    showError('Map the required columns first: ' + missing.map(k => labels[k]).join(', ') + '.');
+    return false;
+  }
+  showError('');
+  ticketRecords = groupTimeEntriesIntoTickets(parsedRows, m);
+  if (!ticketRecords.length) { showError('Grouping produced 0 ticket records — check the Company/Ticket-number mapping.'); return false; }
+
+  const totalHours = ticketRecords.reduce((s, r) => s + r.hours, 0);
+  const nbHours = ticketRecords.reduce((s, r) => s + r.nonbillable_hours, 0);
+  const withNotes = ticketRecords.filter(r => r.has_notes).length;
+  const companies = new Set(ticketRecords.map(r => r.company)).size;
+  const nbPct = totalHours > 0 ? (nbHours / totalHours * 100) : 0;
+  const notesPct = ticketRecords.length > 0 ? (withNotes / ticketRecords.length * 100) : 0;
+
+  const el = document.getElementById('groupSummary');
+  el.style.display = 'block';
+  el.innerHTML =
+    `<strong>${ticketRecords.length.toLocaleString()}</strong> ticket records from ` +
+    `<strong>${parsedRows.length.toLocaleString()}</strong> time entries across ` +
+    `<strong>${companies}</strong> companies. ` +
+    `Total ${totalHours.toLocaleString(undefined, {maximumFractionDigits: 0})} h; ` +
+    `non-billable ${nbHours.toLocaleString(undefined, {maximumFractionDigits: 0})} h (${nbPct.toFixed(1)}%). ` +
+    `${notesPct.toFixed(0)}% of tickets have ≥1 note.`;
+
+  const statusEl = document.getElementById('groupStatus');
+  statusEl.textContent = 'Grouped ✓';
+  statusEl.style.color = 'var(--low)';
+  return true;
+}
+
+document.getElementById('groupBtn').addEventListener('click', runGrouping);
 
 // --- Rubric table (AI-generated, editable, or replace via bulk paste) ---
 
@@ -303,26 +462,27 @@ async function runClassification() {
   showError('');
 
   if (!rubric.length) { showError('Add at least one workflow to the rubric.'); return; }
-  if (!parsedRows.length) { showError('Upload a ticket spreadsheet first.'); return; }
+  if (!parsedRows.length) { showError('Upload a time-entry export first.'); return; }
+  if (!ticketRecords.length && !runGrouping()) return; // group first (also validates required columns)
 
-  const companyCol = document.getElementById('colCompany').value;
-  const hoursCol = document.getElementById('colHours').value;
-  const touchesCol = document.getElementById('colTouches').value;
-  const firstResCol = document.getElementById('colFirstRes').value;
-  const ticketCountCol = document.getElementById('colTicketCount').value;
-  const textCols = [...document.querySelectorAll('.text-col-check:checked')].map(cb => cb.value);
-
-  if (!hoursCol || !touchesCol) { showError('Map the required columns (Hours, Touches).'); return; }
-  if (!textCols.length) { showError('Select at least one classification text column.'); return; }
-
-  const tickets = parsedRows.map(r => ({
-    company: companyCol ? String(r[companyCol] ?? 'All') : 'All',
-    text: textCols.map(c => `${c}: ${r[c] ?? ''}`).join(' | '),
-    hours: parseFloat(r[hoursCol]) || 0,
-    touches: parseFloat(r[touchesCol]) || 0,
-    firstTouchResolved: firstResCol ? parseBoolish(r[firstResCol]) : null,
-    ticketCount: ticketCountCol ? (parseFloat(r[ticketCountCol]) || 0) : 1,
-  }));
+  // Classify the grouped ticket records. The classification signal is the concatenated
+  // engineer notes (mostly Dutch), prefixed with the label/contract tags for extra context.
+  const tickets = ticketRecords.map(rec => {
+    const tags = [
+      rec.labels.length ? `Labels: ${rec.labels.join(', ')}` : '',
+      rec.contract_types.length ? `Contract: ${rec.contract_types.join(', ')}` : '',
+    ].filter(Boolean).join(' | ');
+    return {
+      ticket_id: rec.ticket_id,
+      company: rec.company,
+      text: (tags ? tags + '\n' : '') + (rec.notes || '(no notes)'),
+      hours: rec.hours,
+      touches: rec.touches,
+      firstTouchResolved: null,
+      ticketCount: 1,
+      record: rec,
+    };
+  });
 
   const validNames = new Set(rubric.map(r => r.name));
 
@@ -391,6 +551,7 @@ async function runClassification() {
     const c = classifications[i];
     const workflow = (c && c.workflow && c.workflow !== 'NONE') ? c.workflow : CATCHALL_WORKFLOW;
     const category = catByName.get(workflow) || 'Other';
+    if (t.record) { t.record.workflow = workflow; t.record.category = category; } // let the non-billable pivot be workflow-aware
     let first_touch;
     if (t.firstTouchResolved != null) {
       first_touch = t.firstTouchResolved;
@@ -538,7 +699,152 @@ function showDashboard() {
   document.getElementById('dashboardSection').style.display = 'block';
   populateCompanyFilter();
   render();
+  setDashboardView('workflow');
 }
+
+// --- Dashboard view switching (Workflow vs Non-Billable) ---
+
+function setDashboardView(view) {
+  const isNb = view === 'nonbillable';
+  document.getElementById('workflowView').style.display = isNb ? 'none' : 'block';
+  document.getElementById('nonBillableView').style.display = isNb ? 'block' : 'none';
+  // Workflow-specific export buttons only make sense on the workflow view (NB export lands in Phase 5).
+  document.getElementById('exportCsvBtn').style.display = isNb ? 'none' : '';
+  document.getElementById('exportBtn').style.display = isNb ? 'none' : '';
+  document.getElementById('viewWorkflowBtn').className = 'btn small' + (isNb ? ' secondary' : '');
+  document.getElementById('viewNonBillableBtn').className = 'btn small' + (isNb ? '' : ' secondary');
+  if (isNb) renderNonBillable();
+}
+
+// Reachable straight after grouping (no classification / no API calls).
+function showNonBillable() {
+  if (!ticketRecords.length && !runGrouping()) return;
+  document.getElementById('setupSection').style.display = 'none';
+  document.getElementById('dashboardSection').style.display = 'block';
+  populateNbCompanyFilter();
+  setDashboardView('nonbillable');
+}
+
+document.getElementById('viewWorkflowBtn').addEventListener('click', () => {
+  if (!dashboardRows.length) { showError('Classify tickets first to see the workflow dashboard.'); return; }
+  showError('');
+  setDashboardView('workflow');
+});
+document.getElementById('viewNonBillableBtn').addEventListener('click', () => setDashboardView('nonbillable'));
+document.getElementById('nonBillableBtn').addEventListener('click', showNonBillable);
+
+// --- Feature B: non-billable analysis (aggregation over ticket records, no LLM) ---
+
+const NB_GROUP_DEFS = {
+  company_workflow: { cols: ['Company', 'Workflow'], parts: r => [r.company, r.workflow || '(not classified)'], showWfPct: true },
+  company: { cols: ['Company'], parts: r => [r.company], showWfPct: false },
+  workflow: { cols: ['Workflow'], parts: r => [r.workflow || '(not classified)'], showWfPct: true },
+  contract: { cols: ['Contract type'], parts: r => [r.contract_types.join(' + ') || '(none)'], showWfPct: false },
+  role: { cols: ['Role / team'], parts: r => [r.roles.join(' + ') || '(none)'], showWfPct: false },
+};
+
+function nbScopeFilter(records, scope) {
+  let recs = records.filter(r => r.nonbillable_hours > 0);
+  if (scope === 'fully') recs = recs.filter(r => r.nonbillable_flag === 'fully');
+  else if (scope === 'partial') recs = recs.filter(r => r.nonbillable_flag === 'partial');
+  return recs;
+}
+
+// Build grouped non-billable rows. Denominator for the "% of group hours" metric is the
+// group's TOTAL hours (billable + non-billable) over all records — so for a Workflow grouping
+// this is exactly ENT-1998 §3's "% of that workflow's total hours that is non-billable".
+function buildNbTable(allRecords, def, scope) {
+  const inScope = nbScopeFilter(allRecords, scope);
+  const totalNb = inScope.reduce((s, r) => s + r.nonbillable_hours, 0);
+  const keyOf = r => def.parts(r).join('␟');
+  const groupAllHours = new Map();
+  for (const r of allRecords) { const k = keyOf(r); groupAllHours.set(k, (groupAllHours.get(k) || 0) + r.hours); }
+  const groups = new Map();
+  for (const r of inScope) {
+    const k = keyOf(r);
+    let g = groups.get(k);
+    if (!g) { g = { key: k, parts: def.parts(r), fully: 0, partial: 0, nbHours: 0 }; groups.set(k, g); }
+    if (r.nonbillable_flag === 'fully') g.fully++; else if (r.nonbillable_flag === 'partial') g.partial++;
+    g.nbHours += r.nonbillable_hours;
+  }
+  const rows = [...groups.values()].map(g => {
+    const groupHours = groupAllHours.get(g.key) || 0;
+    return {
+      parts: g.parts,
+      fully: g.fully,
+      partial: g.partial,
+      tickets: g.fully + g.partial,
+      nbHours: g.nbHours,
+      pctOfTotalNb: totalNb > 0 ? (g.nbHours / totalNb * 100) : 0,
+      pctOfGroupHoursNb: groupHours > 0 ? (g.nbHours / groupHours * 100) : 0,
+    };
+  });
+  rows.sort((a, b) => b.nbHours - a.nbHours);
+  return { rows, totalNb };
+}
+
+function populateNbCompanyFilter() {
+  const el = document.getElementById('nbCompanyFilter');
+  const companies = Array.from(new Set(ticketRecords.map(r => r.company))).sort();
+  el.innerHTML = '<option value="all">All Companies</option>' +
+    companies.map(c => `<option value="${escapeAttr(c)}">${xmlEscape(c)}</option>`).join('');
+  el.value = 'all';
+}
+
+function renderNonBillable() {
+  const company = document.getElementById('nbCompanyFilter').value;
+  const groupBy = document.getElementById('nbGroupBy').value;
+  const scope = document.getElementById('nbScope').value;
+  const def = NB_GROUP_DEFS[groupBy] || NB_GROUP_DEFS.company_workflow;
+
+  const records = company === 'all' ? ticketRecords : ticketRecords.filter(r => r.company === company);
+  const { rows, totalNb } = buildNbTable(records, def, scope);
+
+  // Summary tiles
+  const inScopeAll = nbScopeFilter(records, 'all');
+  const fully = inScopeAll.filter(r => r.nonbillable_flag === 'fully').length;
+  const partial = inScopeAll.filter(r => r.nonbillable_flag === 'partial').length;
+  const totalHoursAll = records.reduce((s, r) => s + r.hours, 0);
+  const nbHoursAll = records.reduce((s, r) => s + r.nonbillable_hours, 0);
+  const nbPctAll = totalHoursAll > 0 ? (nbHoursAll / totalHoursAll * 100) : 0;
+  const companiesAffected = new Set(inScopeAll.map(r => r.company)).size;
+  document.getElementById('nbSummaryStats').innerHTML = `
+    <div class="stat"><div class="num">${nbHoursAll.toLocaleString(undefined, {maximumFractionDigits: 0})}</div><div class="lbl">Non-Billable Hours</div></div>
+    <div class="stat"><div class="num">${(fully + partial).toLocaleString()}</div><div class="lbl">Non-Billable Tickets</div></div>
+    <div class="stat"><div class="num">${fully.toLocaleString()}</div><div class="lbl">Fully Non-Billable</div></div>
+    <div class="stat"><div class="num">${partial.toLocaleString()}</div><div class="lbl">Partially Non-Billable</div></div>
+    <div class="stat"><div class="num">${nbPctAll.toFixed(1)}%</div><div class="lbl">of All Hours</div></div>
+    <div class="stat"><div class="num">${companiesAffected.toLocaleString()}</div><div class="lbl">Companies Affected</div></div>
+  `;
+
+  // Header
+  const headCells = def.cols.map(c => `<th>${xmlEscape(c)}</th>`).join('') +
+    '<th class="num-cell">NB Tickets</th>' +
+    '<th class="num-cell">Fully</th>' +
+    '<th class="num-cell">Partial</th>' +
+    '<th class="num-cell">NB Hours</th>' +
+    '<th class="num-cell">% of Total NB</th>' +
+    (def.showWfPct ? '<th class="num-cell">% of Hours NB</th>' : '');
+  document.getElementById('nbTableHead').innerHTML = `<tr>${headCells}</tr>`;
+
+  // Body
+  document.getElementById('nbTableBody').innerHTML = rows.map(r => {
+    const dimCells = r.parts.map(p => `<td>${xmlEscape(p)}</td>`).join('');
+    return `<tr>
+      ${dimCells}
+      <td class="num-cell">${r.tickets.toLocaleString()}</td>
+      <td class="num-cell">${r.fully.toLocaleString()}</td>
+      <td class="num-cell">${r.partial.toLocaleString()}</td>
+      <td class="num-cell">${r.nbHours.toLocaleString(undefined, {maximumFractionDigits: 1})}</td>
+      <td class="num-cell">${r.pctOfTotalNb.toFixed(1)}%</td>
+      ${def.showWfPct ? `<td class="num-cell">${r.pctOfGroupHoursNb.toFixed(1)}%</td>` : ''}
+    </tr>`;
+  }).join('') || `<tr><td colspan="${def.cols.length + 6}" style="text-align:center; color:var(--text-dim);">No non-billable tickets in scope.</td></tr>`;
+}
+
+['nbCompanyFilter', 'nbGroupBy', 'nbScope'].forEach(id => {
+  document.getElementById(id).addEventListener('change', renderNonBillable);
+});
 
 // --- Export: clipboard TSV ---
 

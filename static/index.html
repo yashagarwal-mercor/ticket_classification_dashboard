@@ -8,15 +8,15 @@
 <body>
 
 <h1>Ticket Workflow Classifier &amp; Dashboard</h1>
-<div class="subtitle">Upload a ticket spreadsheet, set your complexity thresholds, and let AI infer the column mapping and workflow rubric for you — review before it runs.</div>
+<div class="subtitle">Upload a <strong>time-entry export</strong> (one row per time entry). Entries are grouped into ticket records by company + ticket number, then classified against your workflow rubric for reconciliation and non-billable analysis.</div>
 
 <div id="setupSection">
 
   <div class="panel">
-    <h2><span class="step-label">1</span>Ticket Spreadsheet</h2>
+    <h2><span class="step-label">1</span>Time-Entry Export</h2>
     <div class="field-row">
       <div class="field" style="flex: 2 1 320px;">
-        <label for="fileInput">Upload .xlsx or .csv</label>
+        <label for="fileInput">Upload .xlsx or .csv — one row per time entry</label>
         <input type="file" id="fileInput" accept=".xlsx,.xls,.csv">
       </div>
     </div>
@@ -49,45 +49,77 @@
   </div>
 
   <div class="panel" id="analyzePanel" style="display:none;">
-    <h2><span class="step-label">3</span>Auto-map Columns <span style="font-weight:400; color:var(--text-dim); font-size:13px;">(optional)</span></h2>
-    <div class="hint">Optional helper: reads the headers and a sample of rows and fills in the column mapping below (company, hours, touches, ticket-count, etc). Always review what it picks. You can also skip this and map the columns yourself. The workflow rubric is not generated — you write it in step 5.</div>
-    <button class="btn" id="analyzeBtn">Infer Column Mapping with AI</button>
+    <h2><span class="step-label">3</span>Map Columns</h2>
+    <div class="hint">For a standard TechOne time-entry export, click <strong>TechOne preset</strong> to fill the mapping in one click. Otherwise let AI infer it from the headers, or map by hand in step 4. Always review before grouping. The workflow rubric is not generated — you supply it in step 5.</div>
+    <button class="btn" id="presetBtn">TechOne preset</button>
+    <button class="btn secondary" id="analyzeBtn">Infer Column Mapping with AI</button>
     <span id="analyzeStatus" style="margin-left:10px; font-size:12.5px;"></span>
   </div>
 
   <div class="panel" id="reviewPanel" style="display:none;">
     <h2><span class="step-label">4</span>Review: Column Mapping</h2>
+    <div class="hint" style="margin-bottom:12px;">Fields marked * are required. Rows are grouped into one ticket record per <strong>Company + Ticket Number</strong>; notes are concatenated in start-time order, hours summed, touches counted.</div>
     <div class="field-row">
       <div class="field">
-        <label for="colCompany">Company column (optional)</label>
-        <select id="colCompany"></select>
+        <label for="colInstance">Company / instance *</label>
+        <select id="colInstance"></select>
       </div>
       <div class="field">
-        <label for="colHours">Hours column *</label>
-        <select id="colHours"></select>
+        <label for="colTicketNumber">Ticket number *</label>
+        <select id="colTicketNumber"></select>
       </div>
       <div class="field">
-        <label for="colTouches">Touches column *</label>
-        <select id="colTouches"></select>
+        <label for="colStartDate">Start date/time * (chronological note order)</label>
+        <select id="colStartDate"></select>
       </div>
     </div>
     <div class="field-row">
       <div class="field">
-        <label for="colFirstRes">First-Touch-Resolved / CountFirstResolution (optional)</label>
-        <select id="colFirstRes"></select>
+        <label for="colSummaryNotes">Summary notes * (primary signal)</label>
+        <select id="colSummaryNotes"></select>
       </div>
       <div class="field">
-        <label for="colTicketCount">Ticket Count (optional — for pre-aggregated data)</label>
-        <select id="colTicketCount"></select>
+        <label for="colInternalNotes">Internal notes (optional)</label>
+        <select id="colInternalNotes"></select>
+      </div>
+      <div class="field">
+        <label for="colKpiLabel">Label / KPI level 1 (optional)</label>
+        <select id="colKpiLabel"></select>
       </div>
     </div>
     <div class="field-row">
-      <div class="field" style="flex: 1 1 100%;">
-        <label>Classification text column(s) * — select one or more; if more than one, they're combined per row</label>
-        <div id="textColsChecklist" class="checklist"></div>
+      <div class="field">
+        <label for="colHoursWorked">Hours worked * (Sumhoursworked)</label>
+        <select id="colHoursWorked"></select>
+      </div>
+      <div class="field">
+        <label for="colHoursToBill">Hours to bill (Sumhourstobill)</label>
+        <select id="colHoursToBill"></select>
+      </div>
+      <div class="field">
+        <label for="colNonBillable">Non-billable flag (isnonbillable)</label>
+        <select id="colNonBillable"></select>
       </div>
     </div>
-    <div class="hint">"Ticket Count" is for pre-aggregated exports where each row already represents a group of N tickets (e.g. one row per tag combo per month) rather than one row per ticket — leave blank if every row is a single ticket.</div>
+    <div class="field-row">
+      <div class="field">
+        <label for="colRoles">Role / team (all_roles[name])</label>
+        <select id="colRoles"></select>
+      </div>
+      <div class="field">
+        <label for="colBillingCodes">Billing code (all_billingcodes[name])</label>
+        <select id="colBillingCodes"></select>
+      </div>
+      <div class="field">
+        <label for="colContractType">Contract type (contracttype)</label>
+        <select id="colContractType"></select>
+      </div>
+    </div>
+    <div style="margin-top:14px;">
+      <button class="btn" id="groupBtn">Group into ticket records</button>
+      <span id="groupStatus" style="margin-left:10px; font-size:12.5px;"></span>
+    </div>
+    <div class="hint" id="groupSummary" style="margin-top:10px; display:none;"></div>
   </div>
 
   <div class="panel" id="rubricPanel" style="display:none;">
@@ -113,6 +145,8 @@
 
   <div class="panel" id="classifyPanel" style="display:none;">
     <button class="btn" id="classifyBtn">Classify Tickets &amp; Build Dashboard</button>
+    <button class="btn secondary" id="nonBillableBtn">View Non-Billable Analysis</button>
+    <span class="hint" style="margin-left:6px;">Non-billable analysis needs only grouping — no classification or API calls.</span>
     <div class="progress-wrap" id="progressWrap" style="display:none;">
       <div class="progress-bar-outer"><div class="progress-bar-inner" id="progressBarInner"></div></div>
       <div class="progress-text" id="progressText"></div>
@@ -123,46 +157,81 @@
 </div>
 
 <div id="dashboardSection">
-  <div class="panel" style="display:flex; gap:10px; align-items:center;">
+  <div class="panel" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
     <button class="btn secondary small" id="startOverBtn">&larr; Start Over</button>
+    <button class="btn small" id="viewWorkflowBtn">Workflow Dashboard</button>
+    <button class="btn secondary small" id="viewNonBillableBtn">Non-Billable Analysis</button>
     <div class="spacer"></div>
     <button class="btn secondary small" id="exportCsvBtn">Export Excel (by Company)</button>
     <button class="btn secondary small" id="exportBtn">See in Excel</button>
   </div>
 
-  <div class="summary" id="summaryStats"></div>
+  <div id="workflowView">
+    <div class="summary" id="summaryStats"></div>
 
-  <div class="controls">
-    <label for="companyFilter">Company</label>
-    <select id="companyFilter"></select>
-    <label for="tierFilter">Complexity</label>
-    <select id="tierFilter">
-      <option value="all">All Tiers</option>
-      <option value="low">Low</option>
-      <option value="medium">Medium</option>
-      <option value="high">High</option>
-    </select>
-    <div class="spacer"></div>
+    <div class="controls">
+      <label for="companyFilter">Company</label>
+      <select id="companyFilter"></select>
+      <label for="tierFilter">Complexity</label>
+      <select id="tierFilter">
+        <option value="all">All Tiers</option>
+        <option value="low">Low</option>
+        <option value="medium">Medium</option>
+        <option value="high">High</option>
+      </select>
+      <div class="spacer"></div>
+    </div>
+
+    <div class="table-scroll">
+    <table class="dash">
+      <thead>
+        <tr>
+          <th data-key="category">Category</th>
+          <th data-key="workflow">Workflow</th>
+          <th data-key="tickets" class="num-cell">Tickets</th>
+          <th data-key="ticketPct" class="num-cell">% of Tickets</th>
+          <th data-key="hours" class="num-cell">Total Hours</th>
+          <th data-key="hoursPct" class="num-cell">% of Total Hours</th>
+          <th data-key="aht" class="num-cell">AHT (min)</th>
+          <th data-key="frr" class="num-cell">FRR</th>
+          <th data-key="touches" class="num-cell">Touches/Ticket</th>
+          <th data-key="tier">Complexity</th>
+        </tr>
+      </thead>
+      <tbody id="tableBody"></tbody>
+    </table>
+    </div>
   </div>
 
-  <div class="table-scroll">
-  <table class="dash">
-    <thead>
-      <tr>
-        <th data-key="category">Category</th>
-        <th data-key="workflow">Workflow</th>
-        <th data-key="tickets" class="num-cell">Tickets</th>
-        <th data-key="ticketPct" class="num-cell">% of Tickets</th>
-        <th data-key="hours" class="num-cell">Total Hours</th>
-        <th data-key="hoursPct" class="num-cell">% of Total Hours</th>
-        <th data-key="aht" class="num-cell">AHT (min)</th>
-        <th data-key="frr" class="num-cell">FRR</th>
-        <th data-key="touches" class="num-cell">Touches/Ticket</th>
-        <th data-key="tier">Complexity</th>
-      </tr>
-    </thead>
-    <tbody id="tableBody"></tbody>
-  </table>
+  <div id="nonBillableView" style="display:none;">
+    <div class="summary" id="nbSummaryStats"></div>
+
+    <div class="controls">
+      <label for="nbCompanyFilter">Company</label>
+      <select id="nbCompanyFilter"></select>
+      <label for="nbGroupBy">Break down by</label>
+      <select id="nbGroupBy">
+        <option value="company_workflow">Company × Workflow</option>
+        <option value="company">Company</option>
+        <option value="workflow">Workflow</option>
+        <option value="contract">Contract type</option>
+        <option value="role">Role / team</option>
+      </select>
+      <label for="nbScope">Show</label>
+      <select id="nbScope">
+        <option value="all">Fully + partial</option>
+        <option value="fully">Fully non-billable only</option>
+        <option value="partial">Partial only</option>
+      </select>
+      <div class="spacer"></div>
+    </div>
+
+    <div class="table-scroll">
+      <table class="dash" id="nbTable">
+        <thead id="nbTableHead"></thead>
+        <tbody id="nbTableBody"></tbody>
+      </table>
+    </div>
   </div>
 </div>
 
