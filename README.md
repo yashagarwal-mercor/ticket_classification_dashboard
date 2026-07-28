@@ -12,25 +12,34 @@ always written by you — the tool does not invent workflows on your behalf.
 
 ## Setup
 
-1. Install the Anthropic Python SDK:
+1. Create and activate a virtual environment:
 
    ```
-   pip3 install anthropic
+   python3 -m venv .venv
+   source .venv/bin/activate
    ```
 
-2. Export your Anthropic API key:
+   (On Windows: `.venv\Scripts\activate`)
+
+2. Install the Anthropic Python SDK into the virtual environment:
+
+   ```
+   pip install anthropic
+   ```
+
+3. Export your Anthropic API key:
 
    ```
    export ANTHROPIC_API_KEY="sk-ant-..."
    ```
 
-3. Run the server:
+4. Run the server (with the virtual environment still active):
 
    ```
    python3 server.py
    ```
 
-4. Open [http://localhost:8787](http://localhost:8787) in your browser.
+5. Open [http://localhost:8787](http://localhost:8787) in your browser.
 
 The Python process serves the static frontend and proxies the two Claude API
 calls (column-mapping inference and per-batch classification) — your API key
