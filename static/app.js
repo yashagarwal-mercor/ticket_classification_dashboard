@@ -1516,6 +1516,33 @@ function render() {
     <div class="stat tier-stat tier-stat-high"><div class="num">${tierCounts.high.toLocaleString()}</div><div class="lbl">High-Complexity Tickets (${tierPct('high').toFixed(0)}%)</div></div>
   `;
 
+  // Reconciliation-status summary — a strip of cards counting workflows by
+  // status across the currently-filtered view. Shown only once reconciliation
+  // has run. Colors mirror the badge palette (aligned=green ... changed=red).
+  const reconSummaryEl = document.getElementById('reconSummaryStats');
+  if (hasRecon) {
+    const rc = { 'Aligned': 0, 'Minor drift': 0, 'Significantly changed': 0, 'Insufficient evidence': 0 };
+    let notReconciled = 0;
+    for (const r of agg) {
+      const v = reconciliation.get(r.workflow);
+      if (v && rc[v.status] != null) rc[v.status]++;
+      else if (!v) notReconciled++;
+    }
+    const reconWfPct = n => agg.length > 0 ? (n / agg.length * 100) : 0;
+    const card = (n, label, cls) => `<div class="stat ${cls}"><div class="num">${n.toLocaleString()}</div><div class="lbl">${label}</div></div>`;
+    reconSummaryEl.innerHTML =
+      card(agg.length, 'Workflows Reconciled', '') +
+      card(rc['Aligned'], `Aligned (${reconWfPct(rc['Aligned']).toFixed(0)}%)`, 'tier-stat tier-stat-low') +
+      card(rc['Minor drift'], `Minor Drift (${reconWfPct(rc['Minor drift']).toFixed(0)}%)`, 'tier-stat tier-stat-medium') +
+      card(rc['Significantly changed'], `Significantly Changed (${reconWfPct(rc['Significantly changed']).toFixed(0)}%)`, 'tier-stat tier-stat-high') +
+      card(rc['Insufficient evidence'], 'Insufficient Evidence', 'tier-stat tier-stat-neutral') +
+      (notReconciled ? card(notReconciled, 'Not Reconciled', 'tier-stat tier-stat-neutral') : '');
+    reconSummaryEl.style.display = '';
+  } else {
+    reconSummaryEl.style.display = 'none';
+    reconSummaryEl.innerHTML = '';
+  }
+
   const descByName = new Map(rubric.map(r => [r.name, r.description]));
   tableBody.innerHTML = agg.map(r => `
     <tr>

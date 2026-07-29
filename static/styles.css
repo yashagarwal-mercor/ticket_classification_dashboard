@@ -83,6 +83,7 @@ table.rubric-table td.col-actions { width: 40px; }
 .tier-stat-low { border-left: 3px solid var(--low); } .tier-stat-low .num { color: var(--low); }
 .tier-stat-medium { border-left: 3px solid var(--med); } .tier-stat-medium .num { color: var(--med); }
 .tier-stat-high { border-left: 3px solid var(--high); } .tier-stat-high .num { color: var(--high); }
+.tier-stat-neutral { border-left: 3px solid var(--text-dim); } .tier-stat-neutral .num { color: var(--text-dim); }
 
 .controls { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
 .controls select { padding: 7px 10px; border-radius: 7px; border: 1px solid var(--border); background: var(--panel); color: var(--text); font-size: 13px; }
