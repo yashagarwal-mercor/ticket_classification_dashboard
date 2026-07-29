@@ -369,8 +369,10 @@ function runGrouping() {
 
 document.getElementById('groupBtn').addEventListener('click', () => {
   if (!runGrouping()) return;
-  // Prefer restoring a completed run for this dataset; otherwise resume a pending batch.
-  if (!maybeRestoreEnriched()) maybeResumeBatch();
+  // An in-flight batch takes precedence (resume it); otherwise restore the latest
+  // completed run for this dataset. A completed run is only overwritten when a new
+  // run finishes, so cancelling a run leaves the prior results intact.
+  if (!maybeResumeBatch()) maybeRestoreEnriched();
 });
 
 // --- Rubric table (AI-generated, editable, or replace via bulk paste) ---
@@ -712,7 +714,6 @@ function saveEnrichedState() {
   }
 }
 function loadEnrichedState() { try { return JSON.parse(localStorage.getItem(ENRICHED_LS_KEY) || 'null'); } catch (e) { return null; } }
-function clearEnrichedState() { try { localStorage.removeItem(ENRICHED_LS_KEY); } catch (e) {} }
 
 // Restore a completed run for the currently-grouped dataset (no API calls). Treats the
 // stored state as untrusted: validates the fingerprint/shape and coerces any workflow
@@ -743,7 +744,6 @@ function maybeRestoreEnriched() {
 // caps concurrent connections, so the full dataset should use the Batch API path below.
 async function runClassification() {
   cancelRequested = false;
-  clearEnrichedState(); // a fresh run supersedes any previously saved results
   showError('');
   if (!rubric.length) { showError('Add at least one workflow to the rubric.'); return; }
   if (!parsedRows.length) { showError('Upload a time-entry export first.'); return; }
@@ -814,7 +814,6 @@ function clearBatchState() { try { localStorage.removeItem(BATCH_LS_KEY); } catc
 
 async function runBatchClassification() {
   cancelRequested = false;
-  clearEnrichedState(); // a fresh run supersedes any previously saved results
   showError('');
   if (!rubric.length) { showError('Add at least one workflow to the rubric.'); return; }
   if (!parsedRows.length) { showError('Upload a time-entry export first.'); return; }
