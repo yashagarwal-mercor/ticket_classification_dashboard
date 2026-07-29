@@ -34,6 +34,7 @@ let rubric = [];           // [{name, category, description}]
 let cancelRequested = false;
 let dashboardRows = [];    // [{company, workflow, category, hours, touches, first_touch}]
 let coverageInfo = null;   // {total, unclassified, pct, noNotes, themes:[{theme,description,examples}]} — §2.3 coverage gap
+let activeBatchId = null;  // set while a Batch API run is being polled; enables the Cancel-batch button
 
 function showError(msg) {
   const el = document.getElementById('errorBanner');
@@ -793,16 +794,20 @@ async function pollBatchToCompletion(batchId, tickets, chunks) {
   const total = chunks.length;
   const bar = document.getElementById('progressBarInner');
   const text = document.getElementById('progressText');
+  const cancelBtn = document.getElementById('cancelBtn');
   document.getElementById('progressWrap').style.display = 'block';
   document.getElementById('classifyBtn').disabled = true;
+  activeBatchId = batchId;              // enables the Cancel-batch handler
+  cancelBtn.textContent = 'Cancel batch';
+  const endPoll = () => {
+    activeBatchId = null;
+    cancelBtn.textContent = 'Cancel';
+    document.getElementById('progressWrap').style.display = 'none';
+    document.getElementById('classifyBtn').disabled = false;
+  };
 
   while (true) {
-    if (cancelRequested) {
-      document.getElementById('progressWrap').style.display = 'none';
-      document.getElementById('classifyBtn').disabled = false;
-      showError('Stopped watching the batch — it keeps running on Anthropic. Re-group the same file to resume.');
-      return;
-    }
+    if (cancelRequested) { endPoll(); return; } // the Cancel-batch handler owns the cancel call + message
     let status;
     try {
       const resp = await fetch(`${API_BASE}/api/batch/status?id=${encodeURIComponent(batchId)}`);
@@ -816,11 +821,9 @@ async function pollBatchToCompletion(batchId, tickets, chunks) {
       bar.style.width = pct + '%';
       text.textContent = `Batch classifying: ${done.toLocaleString()} / ${total.toLocaleString()} requests (${pct}%) — ${status.processing_status}. Safe to close the tab.`;
       if (status.processing_status === 'ended') break;
-      if (status.processing_status === 'canceled' || status.processing_status === 'expired') {
-        document.getElementById('progressWrap').style.display = 'none';
-        document.getElementById('classifyBtn').disabled = false;
-        clearBatchState();
-        showError(`Batch ${status.processing_status}. Try again.`);
+      if (['canceled', 'canceling', 'expired'].includes(status.processing_status)) {
+        endPoll(); clearBatchState();
+        showError(`Batch ${status.processing_status}.`);
         return;
       }
     } else {
@@ -836,8 +839,7 @@ async function pollBatchToCompletion(batchId, tickets, chunks) {
     body = await resp.json();
     if (!body.ok) throw new Error(body.error || 'Batch results failed');
   } catch (err) {
-    document.getElementById('progressWrap').style.display = 'none';
-    document.getElementById('classifyBtn').disabled = false;
+    endPoll();
     showError('Could not download batch results: ' + describeError(err));
     return;
   }
@@ -862,7 +864,9 @@ async function pollBatchToCompletion(batchId, tickets, chunks) {
   }
 
   clearBatchState();
-  await finalizeClassification(tickets, classifications);
+  activeBatchId = null;                       // batch done — disable the cancel path
+  cancelBtn.textContent = 'Cancel';
+  await finalizeClassification(tickets, classifications); // keeps progressWrap visible for the theme step
   document.getElementById('progressWrap').style.display = 'none';
   document.getElementById('classifyBtn').disabled = false;
 }
@@ -881,7 +885,29 @@ document.getElementById('classifyBtn').addEventListener('click', () => {
   if (document.getElementById('useBatch').checked) runBatchClassification();
   else runClassification();
 });
-document.getElementById('cancelBtn').addEventListener('click', () => { cancelRequested = true; });
+document.getElementById('cancelBtn').addEventListener('click', async () => {
+  cancelRequested = true; // stops the in-browser worker loop and the batch poll loop
+  const id = activeBatchId;
+  if (!id) return; // in-browser mode: runClassification shows "Classification cancelled."
+  // Batch mode: actually cancel the batch on Anthropic (not just stop watching).
+  activeBatchId = null;
+  document.getElementById('cancelBtn').textContent = 'Cancel';
+  document.getElementById('progressText').textContent = 'Cancelling batch...';
+  try {
+    const resp = await fetch(`${API_BASE}/api/batch/cancel`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ batch_id: id }),
+    });
+    const body = await resp.json();
+    if (!body.ok) throw new Error(body.error || 'cancel failed');
+    showError('Batch cancelled.');
+  } catch (err) {
+    showError(`Could not cancel the batch (id ${id}): ${describeError(err)}`);
+  }
+  clearBatchState();
+  document.getElementById('progressWrap').style.display = 'none';
+  document.getElementById('classifyBtn').disabled = false;
+});
 
 document.getElementById('startOverBtn').addEventListener('click', () => {
   document.getElementById('dashboardSection').style.display = 'none';

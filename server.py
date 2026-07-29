@@ -143,6 +143,8 @@ class Handler(SimpleHTTPRequestHandler):
             self._handle_classify()
         elif self.path == "/api/batch/create":
             self._handle_batch_create()
+        elif self.path == "/api/batch/cancel":
+            self._handle_batch_cancel()
         else:
             self._send_json(404, {"ok": False, "error": "not found"})
 
@@ -210,6 +212,18 @@ class Handler(SimpleHTTPRequestHandler):
             ]
             batch = client.messages.batches.create(requests=requests)
             self._send_json(200, {"ok": True, "batch_id": batch.id, "processing_status": batch.processing_status})
+        except Exception as e:
+            self._send_json(200, {"ok": False, "error": str(e)})
+
+    def _handle_batch_cancel(self):
+        try:
+            body = self._read_body()
+            batch_id = body.get("batch_id", "")
+            if not BATCH_ID_RE.match(batch_id):
+                self._send_json(200, {"ok": False, "error": "invalid batch id"})
+                return
+            b = client.messages.batches.cancel(batch_id)
+            self._send_json(200, {"ok": True, "processing_status": b.processing_status})
         except Exception as e:
             self._send_json(200, {"ok": False, "error": str(e)})
 
