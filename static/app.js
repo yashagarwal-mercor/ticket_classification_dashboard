@@ -1129,7 +1129,7 @@ function exportEnrichedState() {
   const blob = new Blob([json], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
-  a.href = url; a.download = `${datasetFilePrefix()}ent1998_run_${fileTimestamp(now)}.json`;
+  a.href = url; a.download = `${datasetFilePrefix()}run_${fileTimestamp(now)}.json`;
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 2000);
   showToast('Run saved — reload it later with "Load Run (JSON)" on the same dataset.');
