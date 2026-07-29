@@ -204,6 +204,17 @@
         <option value="medium">Medium</option>
         <option value="high">High</option>
       </select>
+      <span id="reconFilterWrap" style="display:none;">
+        <label for="reconFilter">Reconciliation</label>
+        <select id="reconFilter">
+          <option value="all">All Statuses</option>
+          <option value="Aligned">Aligned</option>
+          <option value="Minor drift">Minor drift</option>
+          <option value="Significantly changed">Significantly changed</option>
+          <option value="Insufficient evidence">Insufficient evidence</option>
+          <option value="none">Not reconciled</option>
+        </select>
+      </span>
       <button class="btn small" id="runReconBtn">Run Reconciliation</button>
       <span id="reconStatus" class="hint" style="margin-left:2px;"></span>
       <div class="spacer"></div>

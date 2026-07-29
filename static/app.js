@@ -1378,6 +1378,17 @@ document.getElementById('startOverBtn').addEventListener('click', () => {
 
 const companyFilter = document.getElementById('companyFilter');
 const tierFilterEl = document.getElementById('tierFilter');
+const reconFilterEl = document.getElementById('reconFilter');
+
+// Keep the reconciliation-status filter one row per aggregated workflow.
+// `all` passes everything; `none` matches workflows with no verdict yet;
+// otherwise match the verdict's status string exactly.
+function reconFilterPredicate(workflow) {
+  const rf = reconFilterEl.value;
+  if (rf === 'all') return true;
+  const v = reconciliation && reconciliation.get(workflow);
+  return rf === 'none' ? !v : !!v && v.status === rf;
+}
 const tableBody = document.getElementById('tableBody');
 const summaryStats = document.getElementById('summaryStats');
 let sortKey = 'tickets';
@@ -1463,6 +1474,13 @@ function render() {
 
   const tier = tierFilterEl.value;
   if (tier !== 'all') agg = agg.filter(r => r.tier === tier);
+
+  // The reconciliation filter only makes sense once verdicts exist; hide it
+  // (and neutralize a stale selection) until reconciliation has run.
+  const hasRecon = reconciliation && reconciliation.size > 0;
+  document.getElementById('reconFilterWrap').style.display = hasRecon ? '' : 'none';
+  if (!hasRecon) reconFilterEl.value = 'all';
+  if (reconFilterEl.value !== 'all') agg = agg.filter(r => reconFilterPredicate(r.workflow));
 
   const totalTickets = agg.reduce((s, r) => s + r.tickets, 0);
   const totalHours = agg.reduce((s, r) => s + r.hours, 0);
@@ -1552,6 +1570,7 @@ document.querySelectorAll('table.dash thead th').forEach(th => {
 });
 companyFilter.addEventListener('change', render);
 tierFilterEl.addEventListener('change', render);
+reconFilterEl.addEventListener('change', render);
 document.getElementById('runReconBtn').addEventListener('click', runReconciliation);
 
 function showDashboard() {
@@ -1767,6 +1786,7 @@ function rowsForCompany(company) {
   let agg = aggregateRows(filtered);
   const tier = tierFilterEl.value;
   if (tier !== 'all') agg = agg.filter(r => r.tier === tier);
+  if (reconFilterEl.value !== 'all') agg = agg.filter(r => reconFilterPredicate(r.workflow));
   return sortAggRows(agg);
 }
 
