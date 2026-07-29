@@ -35,6 +35,7 @@ let cancelRequested = false;
 let dashboardRows = [];    // [{company, workflow, category, hours, touches, first_touch}]
 let coverageInfo = null;   // {total, unclassified, pct, noNotes, themes:[{theme,description,examples}]} — §2.3 coverage gap
 let activeBatchId = null;  // set while a Batch API run is being polled; enables the Cancel-batch button
+let reconciliation = null; // Map(workflowName -> verdict) from Feature A reconciliation (Phase 5)
 
 function showError(msg) {
   const el = document.getElementById('errorBanner');
@@ -568,6 +569,264 @@ async function classifyBatch(chunk, validNames) {
     result.set(item.index, { workflow: wf, confidence: item.confidence });
   }
   return result;
+}
+
+// --- Feature A, Stage 1: per-ticket extraction (§2.1.2 / §4 fixed schema) ---
+// For each classified ticket, extract a fixed schema from its notes, per workflow
+// (the workflow's rubric description is included so the model can spot rubric_gaps).
+// Tickets are keyed by uid = "company/ticketnumber" (ticketnumber alone collides
+// across companies). Notes are Dutch; all output is English except evidence_nl.
+
+const EXTRACT_BATCH_SIZE = 8; // extraction output is larger per ticket than classification
+
+const EXTRACTION_SCHEMA = {
+  type: "object",
+  properties: {
+    extractions: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          ticket_id: { type: "string" },
+          main_action: { type: "string" },
+          bottleneck: { type: "string", enum: ["none", "customer wait", "vendor/third-party", "internal handoff", "approval", "technical blocker"] },
+          bottleneck_detail: { type: "string" },
+          customer_contact: { type: "boolean" },
+          customer_contact_channel: { type: "string", enum: ["none", "email", "phone", "remote session", "on-site", "unknown"] },
+          teams_involved: { type: "array", items: { type: "string" } },
+          rubric_gap: { type: "string" },
+          evidence_nl: { type: "string" },
+          evidence_en: { type: "string" },
+        },
+        required: ["ticket_id", "main_action", "bottleneck", "bottleneck_detail", "customer_contact", "customer_contact_channel", "teams_involved", "rubric_gap", "evidence_nl", "evidence_en"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["extractions"],
+  additionalProperties: false,
+};
+
+function buildExtractionSystem(wf) {
+  return `You are analyzing helpdesk/support tickets that were all classified as the workflow "${wf.name}".
+Workflow description (the rubric's stated claim about this process):
+"${wf.description}"
+
+Each ticket comes with its engineer time-entry notes (mostly Dutch, sometimes English). Reason over the Dutch directly — do NOT translate first. For each ticket, extract this fixed schema:
+- main_action: a short English verb phrase for the dominant manual action performed (e.g. "reset password in Entra", "assigned AD group permissions", "escalated to Engineering").
+- bottleneck: the main roadblock/wait — one of: none, customer wait, vendor/third-party, internal handoff, approval, technical blocker.
+- bottleneck_detail: a short English phrase with specifics (empty string when bottleneck is "none").
+- customer_contact: true if the engineer communicated with the customer / end-user on this ticket.
+- customer_contact_channel: one of none, email, phone, remote session, on-site, unknown.
+- teams_involved: the roles/teams that touched the ticket, including escalations named in the notes (e.g. "doorgezet naar Engineering" -> "Engineering"). Use short English labels.
+- rubric_gap: anything the ticket actually involved that the workflow description above does NOT mention; empty string if the ticket fits the description.
+- evidence_nl: the single most telling short quote from the notes, verbatim in its original language.
+- evidence_en: the English translation of that quote.
+
+Output ALL fields in English EXCEPT evidence_nl (keep it verbatim). Echo ticket_id EXACTLY as given. Return exactly one object per input ticket.`;
+}
+
+function buildExtractionUser(chunk) {
+  return "Tickets:\n\n" + chunk.map(t =>
+    `ticket_id: ${t.uid}\nnotes: ${(t.notes || '').replace(/\s+/g, ' ').slice(0, 1500)}`
+  ).join('\n\n');
+}
+
+// Extract one chunk of same-workflow tickets. chunk items: {uid, notes}. wf: {name, description}.
+// Returns Map(uid -> extraction), dropping any echoed id that wasn't sent (anti-hallucination).
+async function extractBatch(chunk, wf) {
+  const resp = await fetch(`${API_BASE}/api/classify`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: MODEL, max_tokens: 4096, system: buildExtractionSystem(wf), user: buildExtractionUser(chunk), schema: EXTRACTION_SCHEMA }),
+  });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  const body = await resp.json();
+  if (!body.ok) throw new Error(body.error || 'Extraction failed');
+  const parsed = JSON.parse(body.text);
+  const sentIds = new Set(chunk.map(t => t.uid));
+  const result = new Map();
+  for (const e of parsed.extractions || []) {
+    if (e && typeof e.ticket_id === 'string' && sentIds.has(e.ticket_id)) result.set(e.ticket_id, e);
+  }
+  return result;
+}
+
+// --- Feature A, Stage 2: per-workflow reconcile (§2.1.3 / §2.2) ---
+const RECON_MIN_EVIDENCE = 5;  // < this many tickets-with-notes -> "Insufficient evidence" (no LLM call, §2.2)
+const RECON_SAMPLE = 40;       // max extractions sent to a single reconcile call (bounds tokens)
+
+const RECONCILE_SCHEMA = {
+  type: "object",
+  properties: {
+    reconciliation_status: { type: "string", enum: ["Aligned", "Minor drift", "Significantly changed"] },
+    observed_differences: { type: "string" },
+    roadblock: { type: "string" },
+    main_action: { type: "string" },
+    evidence_ticket_ids: { type: "array", items: { type: "string" } },
+    suggested_description_update: { type: "string" },
+  },
+  required: ["reconciliation_status", "observed_differences", "roadblock", "main_action", "evidence_ticket_ids", "suggested_description_update"],
+  additionalProperties: false,
+};
+
+// Compact a workflow's extractions into a summary that bounds the reconcile prompt's tokens.
+function aggregateWorkflowExtractions(extractionList, total) {
+  const bottleneckHist = {}, teamsHist = {};
+  let customerContact = 0, gapCount = 0;
+  for (const e of extractionList) {
+    bottleneckHist[e.bottleneck] = (bottleneckHist[e.bottleneck] || 0) + 1;
+    if (e.customer_contact) customerContact++;
+    if (e.rubric_gap && e.rubric_gap.trim()) gapCount++;
+    for (const t of (e.teams_involved || [])) teamsHist[t] = (teamsHist[t] || 0) + 1;
+  }
+  const topTeams = Object.entries(teamsHist).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([t, n]) => `${t} (${n})`);
+  const sample = extractionList.slice(0, RECON_SAMPLE).map(e => ({
+    uid: e.ticket_id, main_action: e.main_action, bottleneck: e.bottleneck,
+    bottleneck_detail: e.bottleneck_detail, rubric_gap: e.rubric_gap, evidence_en: e.evidence_en,
+  }));
+  return { total, withEvidence: extractionList.length, bottleneckHist, customerContact, topTeams, gapCount, sample };
+}
+
+function buildReconcileSystem() {
+  return `You are reconciling ONE helpdesk workflow's rubric description against what engineers ACTUALLY did, using structured extractions from the tickets classified into it. Judge how far the real process has drifted from the description.
+
+Definitions:
+- "Aligned": the notes match the description; the process is as documented.
+- "Minor drift": mostly matches, with small additions, tooling changes, or scope nuances.
+- "Significantly changed": the real process differs materially — different steps, tooling, or scope, or the description no longer describes what these tickets actually are.
+
+Produce (all in English):
+- reconciliation_status: Aligned | Minor drift | Significantly changed.
+- observed_differences: 1-3 sentences on what the notes show that the description doesn't cover, or vice versa.
+- roadblock: the most frequent/impactful roadblock across these tickets.
+- main_action: the dominant manual action across these tickets.
+- evidence_ticket_ids: 2-3 ticket ids from the input that best support the verdict (at least 3 when Significantly changed). Only use ids present in the input.
+- suggested_description_update: a proposed replacement rubric description ONLY when status is "Significantly changed"; otherwise an empty string.`;
+}
+
+function buildReconcileUser(wf, agg) {
+  const lines = agg.sample.map(s =>
+    `- [${s.uid}] action: ${s.main_action}; bottleneck: ${s.bottleneck}${s.bottleneck_detail ? ' (' + s.bottleneck_detail + ')' : ''}; gap: ${s.rubric_gap || '—'}; evidence: ${s.evidence_en}`
+  ).join('\n');
+  return `Workflow: "${wf.name}"
+Rubric description: "${wf.description}"
+
+Tickets classified into this workflow: ${agg.total} (with notes/extractions: ${agg.withEvidence}).
+Bottleneck distribution: ${JSON.stringify(agg.bottleneckHist)}
+Customer contact on: ${agg.customerContact}/${agg.withEvidence} tickets.
+Top teams/roles involved: ${agg.topTeams.join(', ') || '—'}
+Tickets whose notes involved something the description does not mention: ${agg.gapCount}/${agg.withEvidence}
+
+Per-ticket extractions (${agg.sample.length} shown):
+${lines}`;
+}
+
+async function reconcileWorkflow(wf, agg) {
+  const resp = await fetch(`${API_BASE}/api/classify`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: MODEL_SUMMARY, max_tokens: 2048, system: buildReconcileSystem(), user: buildReconcileUser(wf, agg), schema: RECONCILE_SCHEMA }),
+  });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  const body = await resp.json();
+  if (!body.ok) throw new Error(body.error || 'Reconcile failed');
+  const v = JSON.parse(body.text);
+  const sentUids = new Set(agg.sample.map(s => s.uid));
+  const cited = (v.evidence_ticket_ids || []).filter(id => sentUids.has(id)); // drop unknown/hallucinated ids
+  return {
+    status: v.reconciliation_status,
+    observed_differences: v.observed_differences || '',
+    roadblock: v.roadblock || '',
+    main_action: v.main_action || '',
+    evidence_ticket_ids: cited,
+    suggested_description_update: v.reconciliation_status === 'Significantly changed' ? (v.suggested_description_update || '') : '',
+    total: agg.total, withEvidence: agg.withEvidence,
+  };
+}
+
+// Orchestrate Feature A: extract every classified rubric-workflow ticket (with notes),
+// then reconcile each of the rubric's workflows (all get a status; <N with notes ->
+// "Insufficient evidence", no LLM). Wired to a button + rendered in Stage 5c.
+async function runReconciliation() {
+  if (!dashboardRows.length) { showError('Classify tickets first, then run reconciliation.'); return; }
+  cancelRequested = false;
+  showError('');
+
+  const validNames = new Set(rubric.map(r => r.name));
+  const descByName = new Map(rubric.map(r => [r.name, r.description]));
+  const byWorkflow = new Map(); // name -> [{uid, notes}]
+  const totals = new Map();     // name -> classified ticket count
+  for (let i = 0; i < dashboardRows.length; i++) {
+    const wfName = dashboardRows[i].workflow;
+    if (!validNames.has(wfName)) continue; // skip catch-all / non-rubric buckets
+    totals.set(wfName, (totals.get(wfName) || 0) + 1);
+    const rec = ticketRecords[i];
+    if (!rec || !rec.has_notes) continue;
+    if (!byWorkflow.has(wfName)) byWorkflow.set(wfName, []);
+    byWorkflow.get(wfName).push({ uid: `${rec.company}/${rec.ticket_id}`, notes: rec.notes });
+  }
+
+  const progressWrap = document.getElementById('progressWrap');
+  const bar = document.getElementById('progressBarInner');
+  const text = document.getElementById('progressText');
+  progressWrap.style.display = 'block';
+
+  // Stage 1 — extraction (per-workflow chunks, worker pool).
+  const tasks = [];
+  for (const [wfName, tix] of byWorkflow) {
+    const wf = { name: wfName, description: descByName.get(wfName) || '' };
+    for (let i = 0; i < tix.length; i += EXTRACT_BATCH_SIZE) tasks.push({ chunk: tix.slice(i, i + EXTRACT_BATCH_SIZE), wf });
+  }
+  const extractionsByWf = new Map();
+  let ti = 0, exDone = 0;
+  const upEx = () => { bar.style.width = Math.round(exDone / Math.max(tasks.length, 1) * 50) + '%'; text.textContent = `Extracting ticket details: ${exDone} of ${tasks.length} batches...`; };
+  upEx();
+  async function exWorker() {
+    while (ti < tasks.length) {
+      if (cancelRequested) return;
+      const t = tasks[ti++];
+      try {
+        const m = await extractBatch(t.chunk, t.wf);
+        if (!extractionsByWf.has(t.wf.name)) extractionsByWf.set(t.wf.name, []);
+        for (const e of m.values()) extractionsByWf.get(t.wf.name).push(e);
+      } catch (err) { console.error('extract batch failed', err); }
+      exDone++; upEx();
+    }
+  }
+  await Promise.all(Array.from({ length: CONCURRENCY }, exWorker));
+  if (cancelRequested) { progressWrap.style.display = 'none'; showError('Reconciliation cancelled.'); return; }
+
+  // Stage 2 — reconcile every rubric workflow (all get a status).
+  reconciliation = new Map();
+  const llmTasks = [];
+  for (const wf of rubric) {
+    if (!wf.name) continue;
+    const exs = extractionsByWf.get(wf.name) || [];
+    const total = totals.get(wf.name) || 0;
+    if (exs.length < RECON_MIN_EVIDENCE) {
+      reconciliation.set(wf.name, { status: 'Insufficient evidence', total, withEvidence: exs.length, observed_differences: '', roadblock: '', main_action: '', evidence_ticket_ids: [], suggested_description_update: '' });
+    } else {
+      llmTasks.push({ wf, agg: aggregateWorkflowExtractions(exs, total) });
+    }
+  }
+  let ri = 0, rcDone = 0;
+  const upRc = () => { bar.style.width = (50 + Math.round(rcDone / Math.max(llmTasks.length, 1) * 50)) + '%'; text.textContent = `Reconciling workflows: ${rcDone} of ${llmTasks.length}...`; };
+  upRc();
+  async function rcWorker() {
+    while (ri < llmTasks.length) {
+      if (cancelRequested) return;
+      const { wf, agg } = llmTasks[ri++];
+      try { reconciliation.set(wf.name, await reconcileWorkflow(wf, agg)); }
+      catch (err) {
+        reconciliation.set(wf.name, { status: 'Insufficient evidence', total: agg.total, withEvidence: agg.withEvidence, observed_differences: '(reconcile failed: ' + describeError(err) + ')', roadblock: '', main_action: '', evidence_ticket_ids: [], suggested_description_update: '' });
+      }
+      rcDone++; upRc();
+    }
+  }
+  await Promise.all(Array.from({ length: CONCURRENCY }, rcWorker));
+
+  progressWrap.style.display = 'none';
+  render(); // Stage 5c extends render() to show the reconciliation columns
 }
 
 // --- Coverage-gap detection (§2.3): flag when too many tickets fit no workflow ---
