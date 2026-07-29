@@ -753,8 +753,8 @@ async function reconcileWorkflow(wf, agg) {
 // Returns {extractionsByWf: Map(name->[extraction]), exById: Map(uid->extraction)}.
 async function runExtractionSync(tasks, setStatus) {
   const extractionsByWf = new Map(), exById = new Map();
-  let ti = 0, done = 0;
-  const up = () => setStatus(`Extracting ticket details: ${done}/${tasks.length} batches...`);
+  let ti = 0, done = 0, errors = 0;
+  const up = () => setStatus(`Extracting ticket details: ${done}/${tasks.length} batches${errors ? ` (${errors} failed)` : ''}...`);
   up();
   async function worker() {
     while (ti < tasks.length) {
@@ -764,12 +764,12 @@ async function runExtractionSync(tasks, setStatus) {
         const m = await extractBatch(t.chunk, t.wf);
         if (!extractionsByWf.has(t.wf.name)) extractionsByWf.set(t.wf.name, []);
         for (const [uid, e] of m) { extractionsByWf.get(t.wf.name).push(e); exById.set(uid, e); }
-      } catch (err) { console.error('extract batch failed', err); }
+      } catch (err) { errors++; console.error('extract batch failed', err); }
       done++; up();
     }
   }
   await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-  return { extractionsByWf, exById };
+  return { extractionsByWf, exById, errors };
 }
 
 // Extraction via the Batch API (scales past the relay ceiling; tab-closeable). One batch,
@@ -795,7 +795,8 @@ async function runExtractionBatch(tasks, setStatus) {
     if (status.ok) {
       const c = status.request_counts || {};
       const doneN = (c.succeeded || 0) + (c.errored || 0) + (c.canceled || 0) + (c.expired || 0);
-      setStatus(`Extracting via Batch API: ${doneN}/${requests.length} (${status.processing_status}). Safe to close the tab.`);
+      const errPart = (c.errored || 0) ? `, ${c.errored} errored` : '';
+      setStatus(`Extracting via Batch API: ${doneN}/${requests.length} (${c.succeeded || 0} ok${errPart}, ${status.processing_status}). Safe to close the tab.`);
       if (status.processing_status === 'ended') break;
       if (['canceled', 'canceling', 'expired'].includes(status.processing_status)) throw new Error(`extraction batch ${status.processing_status}`);
     } else {
@@ -807,16 +808,18 @@ async function runExtractionBatch(tasks, setStatus) {
   const resultsResp = await fetch(`${API_BASE}/api/batch/results?id=${encodeURIComponent(batchId)}`);
   const body = await resultsResp.json();
   if (!body.ok) throw new Error(body.error || 'batch results failed');
+  let errors = 0;
   for (const res of body.results || []) {
     const m = /^t(\d+)$/.exec(res.custom_id || '');
     if (!m) continue;
     const t = tasks[+m[1]];
-    if (!t || !res.ok) continue;
+    if (!t) continue;
+    if (!res.ok) { errors++; console.error('extract request failed', res.custom_id, res.error); continue; }
     const map = parseExtractions(res.text, new Set(t.chunk.map(x => x.uid)));
     if (!extractionsByWf.has(t.wf.name)) extractionsByWf.set(t.wf.name, []);
     for (const [uid, e] of map) { extractionsByWf.get(t.wf.name).push(e); exById.set(uid, e); }
   }
-  return { extractionsByWf, exById };
+  return { extractionsByWf, exById, errors };
 }
 
 // Orchestrate Feature A: extract every classified rubric-workflow ticket (with notes),
@@ -854,12 +857,17 @@ async function runReconciliation() {
     const wf = { name: wfName, description: descByName.get(wfName) || '' };
     for (let i = 0; i < tix.length; i += EXTRACT_BATCH_SIZE) tasks.push({ chunk: tix.slice(i, i + EXTRACT_BATCH_SIZE), wf });
   }
-  let extractionsByWf, exById;
+  let extractionsByWf, exById, extractionErrors = 0;
   try {
     const useBatch = document.getElementById('useBatch').checked;
     const res = useBatch ? await runExtractionBatch(tasks, setStatus) : await runExtractionSync(tasks, setStatus);
     if (res.cancelled || cancelRequested) { setStatus('Reconciliation cancelled.'); btn.disabled = false; return; }
     ({ extractionsByWf, exById } = res);
+    extractionErrors = res.errors || 0;
+    if (extractionErrors > 0) {
+      const unit = useBatch ? 'request' : 'batch';
+      showError(`Warning: ${extractionErrors} of ${tasks.length} extraction ${unit}(s) failed — the affected tickets contribute no evidence, so some workflows may show less evidence or "Insufficient evidence". See the browser console for details.`);
+    }
   } catch (err) {
     setStatus(''); btn.disabled = false;
     showError('Extraction failed: ' + describeError(err));
