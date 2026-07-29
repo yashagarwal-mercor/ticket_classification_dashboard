@@ -628,7 +628,7 @@ Output ALL fields in English EXCEPT evidence_nl (keep it verbatim). Echo ticket_
 
 function buildExtractionUser(chunk, wf) {
   return `Workflow: "${wf.name}"\nWorkflow description: "${wf.description}"\n\nTickets:\n\n` + chunk.map(t =>
-    `ticket_id: ${t.uid}\nnotes: ${(t.notes || '').replace(/\s+/g, ' ').slice(0, 1500)}`
+    `ticket_id: ${t.uid}\nnotes: ${(t.notes || '').replace(/\s+/g, ' ')}`
   ).join('\n\n');
 }
 
