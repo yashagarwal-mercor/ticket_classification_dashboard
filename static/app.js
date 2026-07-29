@@ -29,6 +29,7 @@ const MAPPING_FILE_KEYS = {
 
 let parsedRows = [];       // raw time-entry rows as objects, keyed by header
 let headers = [];
+let datasetName = '';      // uploaded source filename, used to label exports
 let ticketRecords = [];    // canonical ticket records (one per instance+ticketnumber) — see groupTimeEntriesIntoTickets
 let rubric = [];           // [{name, category, description}]
 let cancelRequested = false;
@@ -87,6 +88,7 @@ function parseCSV(text) {
 }
 
 function handleFile(file) {
+  datasetName = file.name || '';
   const reader = new FileReader();
   const isCSV = /\.csv$/i.test(file.name);
   reader.onload = (e) => {
@@ -1907,9 +1909,16 @@ function buildWorkbookXML() {
 </Workbook>`;
 }
 
+// "sample_time_entries.csv" -> "sample_time_entries_" (sanitized for a filename).
+function datasetFilePrefix() {
+  if (!datasetName) return '';
+  const base = datasetName.replace(/\.[^.]+$/, '').replace(/[^0-9A-Za-z._-]+/g, '_').replace(/^_+|_+$/g, '');
+  return base ? base + '_' : '';
+}
+
 document.getElementById('exportCsvBtn').addEventListener('click', async () => {
   const xml = buildWorkbookXML();
-  const fileLabel = `workflows_by_company.xls`;
+  const fileLabel = `${datasetFilePrefix()}workflows_by_company.xls`;
   let downloadAttempted = false;
   try {
     const blob = new Blob([xml], { type: 'application/vnd.ms-excel' });
