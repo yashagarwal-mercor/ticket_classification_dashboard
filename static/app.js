@@ -1115,14 +1115,21 @@ function applyEnrichedState(st) {
 // grouped dataset loaded first (same fingerprint). ---
 const ENRICHED_FILE_KIND = 'ent1998-enriched';
 
+// Local timestamp to the minute for filenames, e.g. "2026-07-29_1046".
+function fileTimestamp(d) {
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}`;
+}
+
 function exportEnrichedState() {
   if (!dashboardRows.length) { showError('Run a classification first — there is no completed run to save.'); return; }
-  const payload = { _kind: ENRICHED_FILE_KIND, _version: 1, savedAt: new Date().toISOString(), ...buildEnrichedState() };
+  const now = new Date();
+  const payload = { _kind: ENRICHED_FILE_KIND, _version: 1, savedAt: now.toISOString(), ...buildEnrichedState() };
   const json = JSON.stringify(payload);
   const blob = new Blob([json], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
-  a.href = url; a.download = `ent1998_run_${payload.fingerprint.replace(/[^0-9a-zA-Z]+/g, '-')}.json`;
+  a.href = url; a.download = `${datasetFilePrefix()}ent1998_run_${fileTimestamp(now)}.json`;
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 2000);
   showToast('Run saved — reload it later with "Load Run (JSON)" on the same dataset.');
