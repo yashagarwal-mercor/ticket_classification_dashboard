@@ -35,7 +35,8 @@ let cancelRequested = false;
 let dashboardRows = [];    // [{company, workflow, category, hours, touches, first_touch}]
 let coverageInfo = null;   // {total, unclassified, pct, noNotes, themes:[{theme,description,examples}]} — §2.3 coverage gap
 let activeBatchId = null;  // set while a Batch API run is being polled; enables the Cancel-batch button
-let reconciliation = null; // Map(workflowName -> verdict) from Feature A reconciliation (Phase 5)
+let reconciliation = null;      // Map(workflowName -> verdict) from Feature A reconciliation (Phase 5)
+let citedEvidenceById = null;   // Map(uid -> {en, nl}) evidence for cited tickets (rendered + persisted)
 
 function showError(msg) {
   const el = document.getElementById('errorBanner');
@@ -766,20 +767,22 @@ async function runReconciliation() {
     byWorkflow.get(wfName).push({ uid: `${rec.company}/${rec.ticket_id}`, notes: rec.notes });
   }
 
-  const progressWrap = document.getElementById('progressWrap');
-  const bar = document.getElementById('progressBarInner');
-  const text = document.getElementById('progressText');
-  progressWrap.style.display = 'block';
+  const statusEl = document.getElementById('reconStatus');
+  const btn = document.getElementById('runReconBtn');
+  btn.disabled = true;
+  const setStatus = (msg, done) => { statusEl.textContent = msg; statusEl.style.color = done ? 'var(--low)' : 'var(--text-dim)'; };
 
-  // Stage 1 — extraction (per-workflow chunks, worker pool).
+  // Stage 1 — extraction (per-workflow chunks, worker pool). exById lets us surface
+  // per-ticket evidence (English + original Dutch) for the tickets the reconcile cites.
   const tasks = [];
   for (const [wfName, tix] of byWorkflow) {
     const wf = { name: wfName, description: descByName.get(wfName) || '' };
     for (let i = 0; i < tix.length; i += EXTRACT_BATCH_SIZE) tasks.push({ chunk: tix.slice(i, i + EXTRACT_BATCH_SIZE), wf });
   }
   const extractionsByWf = new Map();
+  const exById = new Map();
   let ti = 0, exDone = 0;
-  const upEx = () => { bar.style.width = Math.round(exDone / Math.max(tasks.length, 1) * 50) + '%'; text.textContent = `Extracting ticket details: ${exDone} of ${tasks.length} batches...`; };
+  const upEx = () => setStatus(`Extracting ticket details: ${exDone}/${tasks.length} batches...`);
   upEx();
   async function exWorker() {
     while (ti < tasks.length) {
@@ -788,13 +791,13 @@ async function runReconciliation() {
       try {
         const m = await extractBatch(t.chunk, t.wf);
         if (!extractionsByWf.has(t.wf.name)) extractionsByWf.set(t.wf.name, []);
-        for (const e of m.values()) extractionsByWf.get(t.wf.name).push(e);
+        for (const [uid, e] of m) { extractionsByWf.get(t.wf.name).push(e); exById.set(uid, e); }
       } catch (err) { console.error('extract batch failed', err); }
       exDone++; upEx();
     }
   }
   await Promise.all(Array.from({ length: CONCURRENCY }, exWorker));
-  if (cancelRequested) { progressWrap.style.display = 'none'; showError('Reconciliation cancelled.'); return; }
+  if (cancelRequested) { setStatus('Reconciliation cancelled.'); btn.disabled = false; return; }
 
   // Stage 2 — reconcile every rubric workflow (all get a status).
   reconciliation = new Map();
@@ -810,7 +813,7 @@ async function runReconciliation() {
     }
   }
   let ri = 0, rcDone = 0;
-  const upRc = () => { bar.style.width = (50 + Math.round(rcDone / Math.max(llmTasks.length, 1) * 50)) + '%'; text.textContent = `Reconciling workflows: ${rcDone} of ${llmTasks.length}...`; };
+  const upRc = () => setStatus(`Reconciling workflows: ${rcDone}/${llmTasks.length}...`);
   upRc();
   async function rcWorker() {
     while (ri < llmTasks.length) {
@@ -825,8 +828,20 @@ async function runReconciliation() {
   }
   await Promise.all(Array.from({ length: CONCURRENCY }, rcWorker));
 
-  progressWrap.style.display = 'none';
-  render(); // Stage 5c extends render() to show the reconciliation columns
+  // Keep only the cited tickets' evidence (small subset) for rendering + persistence.
+  citedEvidenceById = new Map();
+  for (const v of reconciliation.values()) {
+    for (const uid of (v.evidence_ticket_ids || [])) {
+      const e = exById.get(uid);
+      if (e && !citedEvidenceById.has(uid)) citedEvidenceById.set(uid, { en: e.evidence_en || '', nl: e.evidence_nl || '' });
+    }
+  }
+
+  btn.disabled = false;
+  const withEv = [...reconciliation.values()].filter(v => v.status !== 'Insufficient evidence').length;
+  setStatus(`Reconciliation complete — ${withEv} workflow(s) with enough evidence, ${reconciliation.size} total.`, true);
+  render();
+  saveEnrichedState();
 }
 
 // --- Coverage-gap detection (§2.3): flag when too many tickets fit no workflow ---
@@ -934,6 +949,7 @@ function applyClassifications(tickets, classifications) {
 // Shared post-classification step for both the in-browser and Batch API paths:
 // build dashboardRows, run the coverage-gap themes (§2.3), persist, and show the dashboard.
 async function finalizeClassification(tickets, classifications) {
+  reconciliation = null; citedEvidenceById = null; // a fresh classification invalidates prior reconciliation
   applyClassifications(tickets, classifications);
 
   coverageInfo = computeCoverage(dashboardRows, ticketRecords);
@@ -967,6 +983,8 @@ function saveEnrichedState() {
     });
     localStorage.setItem(ENRICHED_LS_KEY, JSON.stringify({
       fingerprint: datasetFingerprint(), names, wf, rubric, coverageInfo,
+      reconciliation: reconciliation ? [...reconciliation.entries()] : null,
+      citedEvidence: citedEvidenceById ? [...citedEvidenceById.entries()] : null,
     }));
   } catch (e) {
     console.warn('Could not persist enriched results (localStorage quota?):', e);
@@ -994,6 +1012,8 @@ function maybeRestoreEnriched() {
   });
   applyClassifications(tickets, classifications);
   coverageInfo = (st.coverageInfo && typeof st.coverageInfo === 'object') ? st.coverageInfo : null;
+  reconciliation = Array.isArray(st.reconciliation) ? new Map(st.reconciliation) : null;
+  citedEvidenceById = Array.isArray(st.citedEvidence) ? new Map(st.citedEvidence) : null;
   showError('');
   showDashboard();
   return true;
@@ -1351,8 +1371,8 @@ function render() {
   const descByName = new Map(rubric.map(r => [r.name, r.description]));
   tableBody.innerHTML = agg.map(r => `
     <tr>
-      <td class="cat-name">${r.category}</td>
-      <td class="wf-name">${r.workflow}${descByName.get(r.workflow) ? `<div class="wf-desc">${descByName.get(r.workflow)}</div>` : ''}</td>
+      <td class="cat-name"><div class="cat-cell">${xmlEscape(r.category)}</div></td>
+      <td class="wf-name"><div class="wf-cell">${xmlEscape(r.workflow)}${descByName.get(r.workflow) ? `<div class="wf-desc">${xmlEscape(descByName.get(r.workflow))}</div>` : ''}</div></td>
       <td class="num-cell">${r.tickets.toLocaleString()}</td>
       <td class="num-cell">${r.ticketPct.toFixed(1)}%</td>
       <td class="num-cell">${r.hours.toLocaleString(undefined, {maximumFractionDigits: 1})}</td>
@@ -1361,21 +1381,58 @@ function render() {
       <td class="num-cell">${(r.frr * 100).toFixed(0)}%</td>
       <td class="num-cell">${r.touches.toFixed(2)}</td>
       <td><span class="tier tier-${r.tier}">${r.tier}</span></td>
+      ${renderReconCells(r.workflow)}
     </tr>
   `).join('');
 
   window.__currentAgg = agg;
 }
 
+// Reconciliation cells for one workflow row (Feature A §2.2). All values are
+// LLM-generated and are escaped via xmlEscape() before insertion.
+function renderReconCells(workflowName) {
+  const empty = '<td class="recon-empty">—</td>';
+  const v = reconciliation && reconciliation.get(workflowName);
+  if (!v) return empty + empty + empty + empty;
+
+  const cls = { 'Aligned': 'aligned', 'Minor drift': 'minor', 'Significantly changed': 'changed', 'Insufficient evidence': 'insufficient' }[v.status] || 'insufficient';
+  const sub = v.withEvidence != null ? `<div class="recon-sub">${v.withEvidence} w/ notes</div>` : '';
+  const statusCell = `<td class="recon-td"><span class="recon-badge recon-${cls}">${xmlEscape(v.status)}</span>${sub}</td>`;
+  const diffCell = `<td class="recon-td"><div class="recon-cell">${xmlEscape(v.observed_differences || '')}</div></td>`;
+
+  let rmCell;
+  if (v.status === 'Insufficient evidence' || (!v.roadblock && !v.main_action)) {
+    rmCell = empty;
+  } else {
+    const cites = (v.evidence_ticket_ids || []).map(uid => {
+      const ev = citedEvidenceById && citedEvidenceById.get(uid);
+      if (ev && ev.nl) {
+        return `<details class="recon-ev"><summary>${xmlEscape(uid)}</summary>` +
+          `<div class="recon-en">${xmlEscape(ev.en || '')}</div>` +
+          `<div class="recon-nl">NL: ${xmlEscape(ev.nl)}</div></details>`;
+      }
+      return `<span class="recon-cite">${xmlEscape(uid)}</span>`;
+    }).join('');
+    rmCell = `<td class="recon-td"><div class="recon-cell">` +
+      `<div><strong>Roadblock:</strong> ${xmlEscape(v.roadblock || '—')}</div>` +
+      `<div><strong>Main action:</strong> ${xmlEscape(v.main_action || '—')}</div>` +
+      (cites ? `<div class="recon-cites">${cites}</div>` : '') + `</div></td>`;
+  }
+  const updCell = `<td class="recon-td"><div class="recon-cell">${v.suggested_description_update ? xmlEscape(v.suggested_description_update) : ''}</div></td>`;
+  return statusCell + diffCell + rmCell + updCell;
+}
+
 document.querySelectorAll('table.dash thead th').forEach(th => {
   th.addEventListener('click', () => {
     const key = th.dataset.key;
+    if (!key) return; // reconciliation columns are not sortable
     if (sortKey === key) sortDir *= -1; else { sortKey = key; sortDir = -1; }
     render();
   });
 });
 companyFilter.addEventListener('change', render);
 tierFilterEl.addEventListener('change', render);
+document.getElementById('runReconBtn').addEventListener('click', runReconciliation);
 
 function showDashboard() {
   document.getElementById('setupSection').style.display = 'none';

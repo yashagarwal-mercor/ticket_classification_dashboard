@@ -96,9 +96,11 @@ table.dash thead th:hover { color: var(--text); }
 table.dash tbody td { padding: 9px 12px; font-size: 13px; border-bottom: 1px solid var(--border); white-space: nowrap; }
 table.dash tbody tr:hover { background: var(--row-hover); }
 table.dash tbody tr:last-child td { border-bottom: none; }
-.wf-name { font-weight: 600; white-space: normal; max-width: 320px; }
-.wf-desc { font-weight: 400; font-size: 11.5px; color: var(--text-dim); margin-top: 2px; white-space: normal; max-width: 320px; overflow-wrap: anywhere; }
-.cat-name { color: var(--text-dim); font-size: 12px; white-space: normal; max-width: 180px; overflow-wrap: anywhere; }
+.wf-name { font-weight: 600; vertical-align: top; }
+.wf-cell { max-width: 320px; white-space: normal; overflow-wrap: anywhere; word-break: break-word; }
+.wf-desc { font-weight: 400; font-size: 11.5px; color: var(--text-dim); margin-top: 2px; white-space: normal; overflow-wrap: anywhere; }
+.cat-name { color: var(--text-dim); font-size: 12px; vertical-align: top; }
+.cat-cell { max-width: 150px; white-space: normal; overflow-wrap: anywhere; word-break: break-word; }
 .num-cell { text-align: right; font-variant-numeric: tabular-nums; }
 .tier { display: inline-block; padding: 3px 9px; border-radius: 999px; font-size: 11px; font-weight: 700; }
 .tier-low { background: var(--low-bg); color: var(--low); }
@@ -117,3 +119,21 @@ table.dash tbody tr:last-child td { border-bottom: none; }
 #dashboardSection { display: none; }
 .step-label { display: inline-block; background: var(--accent-dim); color: var(--accent); font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px; margin-right: 8px; }
 .error-banner { background: var(--high-bg); color: var(--high); padding: 10px 14px; border-radius: 8px; font-size: 13px; margin-bottom: 14px; display: none; }
+
+/* Feature A — reconciliation columns (Phase 5c) */
+.recon-empty { color: var(--text-dim); text-align: center; vertical-align: top; }
+.recon-td { vertical-align: top; font-size: 12px; white-space: normal; }
+/* Block child with a real width cap forces the column to wrap (td max-width is unreliable in auto-layout tables). */
+.recon-cell { max-width: 300px; white-space: normal; overflow-wrap: anywhere; word-break: break-word; line-height: 1.35; }
+.recon-badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; white-space: nowrap; }
+.recon-aligned { color: var(--low); background: var(--low-bg); }
+.recon-minor { color: var(--med); background: var(--med-bg); }
+.recon-changed { color: var(--high); background: var(--high-bg); }
+.recon-insufficient { color: var(--text-dim); background: var(--accent-dim); }
+.recon-sub { font-size: 10.5px; color: var(--text-dim); margin-top: 3px; }
+.recon-cites { margin-top: 5px; display: flex; flex-direction: column; gap: 3px; }
+.recon-cite { font-size: 11px; color: var(--text-dim); }
+details.recon-ev { font-size: 11px; }
+details.recon-ev summary { cursor: pointer; color: var(--accent); font-weight: 600; }
+.recon-en { margin: 3px 0 1px; }
+.recon-nl { color: var(--text-dim); font-style: italic; }

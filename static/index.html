@@ -201,6 +201,8 @@
         <option value="medium">Medium</option>
         <option value="high">High</option>
       </select>
+      <button class="btn small" id="runReconBtn">Run Reconciliation</button>
+      <span id="reconStatus" class="hint" style="margin-left:2px;"></span>
       <div class="spacer"></div>
     </div>
 
@@ -218,6 +220,10 @@
           <th data-key="frr" class="num-cell">FRR</th>
           <th data-key="touches" class="num-cell">Touches/Ticket</th>
           <th data-key="tier">Complexity</th>
+          <th>Reconciliation</th>
+          <th>Observed Differences</th>
+          <th>Roadblock &amp; Main Action</th>
+          <th>Suggested Update</th>
         </tr>
       </thead>
       <tbody id="tableBody"></tbody>
