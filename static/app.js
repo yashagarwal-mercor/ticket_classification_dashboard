@@ -368,7 +368,9 @@ function runGrouping() {
 }
 
 document.getElementById('groupBtn').addEventListener('click', () => {
-  if (runGrouping()) maybeResumeBatch(); // auto-resume a pending batch for this dataset
+  if (!runGrouping()) return;
+  // Prefer restoring a completed run for this dataset; otherwise resume a pending batch.
+  if (!maybeRestoreEnriched()) maybeResumeBatch();
 });
 
 // --- Rubric table (AI-generated, editable, or replace via bulk paste) ---
@@ -651,20 +653,27 @@ function chunkTickets(tickets) {
   return chunks;
 }
 
-// Shared post-classification step for both the in-browser and Batch API paths:
-// build dashboardRows, run the coverage-gap themes (§2.3), and show the dashboard.
-async function finalizeClassification(tickets, classifications) {
+// Build dashboardRows from per-ticket classifications and stamp workflow/category
+// back onto the records (so the non-billable pivot is workflow-aware). Shared by the
+// classify paths and the restore-from-localStorage path.
+function applyClassifications(tickets, classifications) {
   const catByName = new Map(rubric.map(r => [r.name, r.category || 'General']));
   dashboardRows = tickets.map((t, i) => {
     const c = classifications[i];
     const workflow = (c && c.workflow && c.workflow !== 'NONE') ? c.workflow : CATCHALL_WORKFLOW;
     const category = catByName.get(workflow) || 'Other';
-    if (t.record) { t.record.workflow = workflow; t.record.category = category; } // keep the non-billable pivot workflow-aware
+    if (t.record) { t.record.workflow = workflow; t.record.category = category; }
     let first_touch;
     if (t.firstTouchResolved != null) first_touch = t.firstTouchResolved;
     else first_touch = (t.ticketCount <= 1 && t.touches === 1) ? 1 : 0;
     return { company: t.company, workflow, category, hours: t.hours, touches: t.touches, first_touch, ticketCount: t.ticketCount };
   });
+}
+
+// Shared post-classification step for both the in-browser and Batch API paths:
+// build dashboardRows, run the coverage-gap themes (§2.3), persist, and show the dashboard.
+async function finalizeClassification(tickets, classifications) {
+  applyClassifications(tickets, classifications);
 
   coverageInfo = computeCoverage(dashboardRows, ticketRecords);
   if (coverageInfo.pct > COVERAGE_GAP_THRESHOLD) {
@@ -676,13 +685,65 @@ async function finalizeClassification(tickets, classifications) {
       coverageInfo.themeError = describeError(err);
     }
   }
+  saveEnrichedState(); // persist so the completed run survives a reload (Phase 6 slice)
   showDashboard();
+}
+
+// --- Persist / restore completed classification results (Phase 6 slice) ---
+// Only the per-ticket workflow is stored (as an index into a names table) plus the
+// rubric and coverage info; everything else (company/hours/touches/category) is
+// reconstructed from the re-grouped records, keeping the payload well under the
+// localStorage quota even at 117K tickets (~350KB).
+const ENRICHED_LS_KEY = 'ent1998_enriched';
+
+function saveEnrichedState() {
+  try {
+    const names = [];
+    const idx = new Map();
+    const wf = dashboardRows.map(r => {
+      if (!idx.has(r.workflow)) { idx.set(r.workflow, names.length); names.push(r.workflow); }
+      return idx.get(r.workflow);
+    });
+    localStorage.setItem(ENRICHED_LS_KEY, JSON.stringify({
+      fingerprint: datasetFingerprint(), names, wf, rubric, coverageInfo,
+    }));
+  } catch (e) {
+    console.warn('Could not persist enriched results (localStorage quota?):', e);
+  }
+}
+function loadEnrichedState() { try { return JSON.parse(localStorage.getItem(ENRICHED_LS_KEY) || 'null'); } catch (e) { return null; } }
+function clearEnrichedState() { try { localStorage.removeItem(ENRICHED_LS_KEY); } catch (e) {} }
+
+// Restore a completed run for the currently-grouped dataset (no API calls). Treats the
+// stored state as untrusted: validates the fingerprint/shape and coerces any workflow
+// name not in the current rubric to the catch-all.
+function maybeRestoreEnriched() {
+  const st = loadEnrichedState();
+  if (!st || st.fingerprint !== datasetFingerprint()) return false;
+  if (!Array.isArray(st.names) || !Array.isArray(st.wf) || st.wf.length !== ticketRecords.length) return false;
+
+  if ((!rubric.length || (rubric.length === 1 && !rubric[0].name)) && Array.isArray(st.rubric) && st.rubric.length) {
+    rubric = st.rubric;
+    renderRubricTable();
+  }
+  const validNames = new Set(rubric.map(r => r.name));
+  const tickets = buildTicketsForClassification();
+  const classifications = st.wf.map(i => {
+    const w = st.names[i];
+    return { workflow: (w === CATCHALL_WORKFLOW || validNames.has(w)) ? w : CATCHALL_WORKFLOW };
+  });
+  applyClassifications(tickets, classifications);
+  coverageInfo = (st.coverageInfo && typeof st.coverageInfo === 'object') ? st.coverageInfo : null;
+  showError('');
+  showDashboard();
+  return true;
 }
 
 // In-browser classification (live, progressive). Best for small slices — the browser
 // caps concurrent connections, so the full dataset should use the Batch API path below.
 async function runClassification() {
   cancelRequested = false;
+  clearEnrichedState(); // a fresh run supersedes any previously saved results
   showError('');
   if (!rubric.length) { showError('Add at least one workflow to the rubric.'); return; }
   if (!parsedRows.length) { showError('Upload a time-entry export first.'); return; }
@@ -753,6 +814,7 @@ function clearBatchState() { try { localStorage.removeItem(BATCH_LS_KEY); } catc
 
 async function runBatchClassification() {
   cancelRequested = false;
+  clearEnrichedState(); // a fresh run supersedes any previously saved results
   showError('');
   if (!rubric.length) { showError('Add at least one workflow to the rubric.'); return; }
   if (!parsedRows.length) { showError('Upload a time-entry export first.'); return; }

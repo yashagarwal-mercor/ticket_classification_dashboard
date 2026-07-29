@@ -12,3 +12,6 @@ sample_data/*.xls
 
 # Internal spec/status doc — kept local, not tracked.
 IMPLEMENTATION.md
+
+# Local diagnostic script — kept local, not tracked.
+list_batches.py
