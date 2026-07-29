@@ -1040,19 +1040,24 @@ async function finalizeClassification(tickets, classifications) {
 // localStorage quota even at 117K tickets (~350KB).
 const ENRICHED_LS_KEY = 'ent1998_enriched';
 
+// Serializable snapshot of a completed run. Stores the per-ticket workflow as an
+// index into a de-duplicated name list (compact for the full 117K dataset).
+function buildEnrichedState() {
+  const names = [];
+  const idx = new Map();
+  const wf = dashboardRows.map(r => {
+    if (!idx.has(r.workflow)) { idx.set(r.workflow, names.length); names.push(r.workflow); }
+    return idx.get(r.workflow);
+  });
+  return {
+    fingerprint: datasetFingerprint(), names, wf, rubric, coverageInfo,
+    reconciliation: reconciliation ? [...reconciliation.entries()] : null,
+    citedEvidence: citedEvidenceById ? [...citedEvidenceById.entries()] : null,
+  };
+}
 function saveEnrichedState() {
   try {
-    const names = [];
-    const idx = new Map();
-    const wf = dashboardRows.map(r => {
-      if (!idx.has(r.workflow)) { idx.set(r.workflow, names.length); names.push(r.workflow); }
-      return idx.get(r.workflow);
-    });
-    localStorage.setItem(ENRICHED_LS_KEY, JSON.stringify({
-      fingerprint: datasetFingerprint(), names, wf, rubric, coverageInfo,
-      reconciliation: reconciliation ? [...reconciliation.entries()] : null,
-      citedEvidence: citedEvidenceById ? [...citedEvidenceById.entries()] : null,
-    }));
+    localStorage.setItem(ENRICHED_LS_KEY, JSON.stringify(buildEnrichedState()));
   } catch (e) {
     console.warn('Could not persist enriched results (localStorage quota?):', e);
   }
@@ -1065,7 +1070,15 @@ function loadEnrichedState() { try { return JSON.parse(localStorage.getItem(ENRI
 function maybeRestoreEnriched() {
   const st = loadEnrichedState();
   if (!st || st.fingerprint !== datasetFingerprint()) return false;
-  if (!Array.isArray(st.names) || !Array.isArray(st.wf) || st.wf.length !== ticketRecords.length) return false;
+  return applyEnrichedState(st);
+}
+
+// Apply a completed-run snapshot (from localStorage or an imported file) to the
+// currently-grouped dataset. Treats `st` as untrusted: validates shape, requires
+// the per-ticket wf[] to line up with ticketRecords (it maps by index), and
+// coerces any workflow name not in the current rubric to the catch-all.
+function applyEnrichedState(st) {
+  if (!st || !Array.isArray(st.names) || !Array.isArray(st.wf) || st.wf.length !== ticketRecords.length) return false;
 
   if ((!rubric.length || (rubric.length === 1 && !rubric[0].name)) && Array.isArray(st.rubric) && st.rubric.length) {
     rubric = st.rubric;
@@ -1084,6 +1097,46 @@ function maybeRestoreEnriched() {
   showError('');
   showDashboard();
   return true;
+}
+
+// --- Enriched-state file export/import (Phase 6): save an expensive completed
+// run to a JSON file and reload it later without re-spending API budget. The
+// snapshot maps workflows per-ticket by index, so import requires the identical
+// grouped dataset loaded first (same fingerprint). ---
+const ENRICHED_FILE_KIND = 'ent1998-enriched';
+
+function exportEnrichedState() {
+  if (!dashboardRows.length) { showError('Run a classification first — there is no completed run to save.'); return; }
+  const payload = { _kind: ENRICHED_FILE_KIND, _version: 1, savedAt: new Date().toISOString(), ...buildEnrichedState() };
+  const json = JSON.stringify(payload);
+  const blob = new Blob([json], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = `ent1998_run_${payload.fingerprint.replace(/[^0-9a-zA-Z]+/g, '-')}.json`;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+  showToast('Run saved — reload it later with "Load Run (JSON)" on the same dataset.');
+}
+
+function importEnrichedState(file) {
+  if (!file) return;
+  if (!ticketRecords.length) { showError('Upload and group the same time-entry export first, then load the saved run.'); return; }
+  const reader = new FileReader();
+  reader.onload = () => {
+    let st;
+    try { st = JSON.parse(reader.result); } catch (e) { showError('That file is not valid JSON — pick a run file saved from this tool.'); return; }
+    if (!st || typeof st !== 'object' || (st._kind && st._kind !== ENRICHED_FILE_KIND)) {
+      showError('That JSON is not an ENT-1998 saved run.'); return;
+    }
+    if (st.fingerprint !== datasetFingerprint()) {
+      showError('This saved run is for a different dataset. Load and group the exact time-entry export it was saved from, then try again.'); return;
+    }
+    if (!applyEnrichedState(st)) { showError('Could not apply the saved run — its shape does not match the current dataset.'); return; }
+    saveEnrichedState(); // mirror the imported run into localStorage so a plain reload keeps it
+    showToast('Saved run loaded — no API budget spent.');
+  };
+  reader.onerror = () => showError('Could not read that file.');
+  reader.readAsText(file);
 }
 
 // In-browser classification (live, progressive). Best for small slices — the browser
@@ -1675,6 +1728,14 @@ function showToast(msg) {
   t.textContent = msg; t.classList.add('show');
   setTimeout(() => t.classList.remove('show'), 2200);
 }
+
+document.getElementById('saveRunBtn').addEventListener('click', exportEnrichedState);
+document.getElementById('loadRunBtn').addEventListener('click', () => document.getElementById('loadRunFile').click());
+document.getElementById('loadRunFile').addEventListener('change', (e) => {
+  const f = e.target.files && e.target.files[0];
+  importEnrichedState(f);
+  e.target.value = ''; // allow re-selecting the same file
+});
 
 document.getElementById('exportBtn').addEventListener('click', async () => {
   const tsv = buildTSV();

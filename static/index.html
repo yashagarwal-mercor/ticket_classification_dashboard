@@ -183,6 +183,9 @@
     <button class="btn small" id="viewWorkflowBtn">Workflow Dashboard</button>
     <button class="btn secondary small" id="viewNonBillableBtn">Non-Billable Analysis</button>
     <div class="spacer"></div>
+    <button class="btn secondary small" id="saveRunBtn" title="Download this completed run as a JSON file so it can be reloaded later without re-running the API">Save Run (JSON)</button>
+    <button class="btn secondary small" id="loadRunBtn" title="Reload a previously saved run for this dataset — no API budget spent">Load Run (JSON)</button>
+    <input type="file" id="loadRunFile" accept="application/json,.json" style="display:none;">
     <button class="btn secondary small" id="exportCsvBtn">Export Excel (by Company)</button>
     <button class="btn secondary small" id="exportBtn">See in Excel</button>
   </div>
