@@ -1743,7 +1743,7 @@ function buildTSV() {
   for (const r of window.__currentAgg || []) {
     const v = reconciliation && reconciliation.get(r.workflow);
     const rc = v
-      ? [v.status, v.observed_differences, v.roadblock, v.main_action, (v.evidence_ticket_ids || []).join(', '), v.suggested_description_update]
+      ? [v.status, v.observed_differences, v.roadblock, v.main_action, citedTicketsList(v).join(' | '), v.suggested_description_update]
       : ['', '', '', '', '', ''];
     lines.push([r.category, r.workflow, r.tickets, r.hours.toFixed(1), r.aht.toFixed(1), (r.frr * 100).toFixed(0) + '%', r.touches.toFixed(2), r.tier, ...rc].map(clean).join('\t'));
   }
@@ -1802,12 +1802,23 @@ const _xStr = v => `<Cell><Data ss:Type="String">${xmlEscape(v == null ? '' : v)
 const _xNum = v => `<Cell><Data ss:Type="Number">${Number(v || 0)}</Data></Cell>`;
 const _xHdr = v => `<Cell ss:StyleID="Header"><Data ss:Type="String">${xmlEscape(v)}</Data></Cell>`;
 
+// Each cited ticket as "english, dutch (uid)" — falls back to the uid alone when
+// no evidence was captured. Shared by the .xls and TSV exports.
+function citedTicketsList(v) {
+  return (v.evidence_ticket_ids || []).map(uid => {
+    const e = citedEvidenceById && citedEvidenceById.get(uid);
+    const en = (e && e.en) ? e.en : '';
+    const nl = (e && e.nl) ? e.nl : '';
+    return (en || nl) ? `${en}, ${nl} (${uid})` : uid;
+  });
+}
+
 // Reconciliation cells for the Workflow Dashboard sheet (empty until reconciliation runs).
 function reconSheetCells(workflow) {
   const v = reconciliation && reconciliation.get(workflow);
   if (!v) return _xStr('') + _xStr('') + _xStr('') + _xStr('') + _xStr('') + _xStr('');
   return _xStr(v.status) + _xStr(v.observed_differences) + _xStr(v.roadblock) + _xStr(v.main_action) +
-    _xStr((v.evidence_ticket_ids || []).join(', ')) + _xStr(v.suggested_description_update);
+    _xStr(citedTicketsList(v).join('\n')) + _xStr(v.suggested_description_update);
 }
 
 function sheetXML(sheetName, rows) {
