@@ -608,49 +608,53 @@ const EXTRACTION_SCHEMA = {
   additionalProperties: false,
 };
 
-function buildExtractionSystem(wf) {
-  return `You are analyzing helpdesk/support tickets that were all classified as the workflow "${wf.name}".
-Workflow description (the rubric's stated claim about this process):
-"${wf.description}"
-
-Each ticket comes with its engineer time-entry notes (mostly Dutch, sometimes English). Reason over the Dutch directly — do NOT translate first. For each ticket, extract this fixed schema:
+// Generic (workflow-agnostic) extraction system prompt — shared across the whole
+// extraction pass so it caches and a single-system Batch request works. The specific
+// workflow name/description go in the user prompt (buildExtractionUser).
+function buildExtractionSystem() {
+  return `You are analyzing helpdesk/support tickets. Each request gives you a workflow's name and rubric description, then a batch of tickets classified into that workflow, each with its engineer time-entry notes (mostly Dutch, sometimes English). Reason over the Dutch directly — do NOT translate first. For each ticket, extract this fixed schema:
 - main_action: a short English verb phrase for the dominant manual action performed (e.g. "reset password in Entra", "assigned AD group permissions", "escalated to Engineering").
 - bottleneck: the main roadblock/wait — one of: none, customer wait, vendor/third-party, internal handoff, approval, technical blocker.
 - bottleneck_detail: a short English phrase with specifics (empty string when bottleneck is "none").
 - customer_contact: true if the engineer communicated with the customer / end-user on this ticket.
 - customer_contact_channel: one of none, email, phone, remote session, on-site, unknown.
 - teams_involved: the roles/teams that touched the ticket, including escalations named in the notes (e.g. "doorgezet naar Engineering" -> "Engineering"). Use short English labels.
-- rubric_gap: anything the ticket actually involved that the workflow description above does NOT mention; empty string if the ticket fits the description.
+- rubric_gap: anything the ticket actually involved that the given workflow description does NOT mention; empty string if the ticket fits the description.
 - evidence_nl: the single most telling short quote from the notes, verbatim in its original language.
 - evidence_en: the English translation of that quote.
 
 Output ALL fields in English EXCEPT evidence_nl (keep it verbatim). Echo ticket_id EXACTLY as given. Return exactly one object per input ticket.`;
 }
 
-function buildExtractionUser(chunk) {
-  return "Tickets:\n\n" + chunk.map(t =>
+function buildExtractionUser(chunk, wf) {
+  return `Workflow: "${wf.name}"\nWorkflow description: "${wf.description}"\n\nTickets:\n\n` + chunk.map(t =>
     `ticket_id: ${t.uid}\nnotes: ${(t.notes || '').replace(/\s+/g, ' ').slice(0, 1500)}`
   ).join('\n\n');
 }
 
-// Extract one chunk of same-workflow tickets. chunk items: {uid, notes}. wf: {name, description}.
-// Returns Map(uid -> extraction), dropping any echoed id that wasn't sent (anti-hallucination).
-async function extractBatch(chunk, wf) {
-  const resp = await fetch(`${API_BASE}/api/classify`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: MODEL, max_tokens: 4096, system: buildExtractionSystem(wf), user: buildExtractionUser(chunk), schema: EXTRACTION_SCHEMA }),
-  });
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-  const body = await resp.json();
-  if (!body.ok) throw new Error(body.error || 'Extraction failed');
-  const parsed = JSON.parse(body.text);
-  const sentIds = new Set(chunk.map(t => t.uid));
+// Parse an extraction response's text into Map(uid -> extraction), dropping any
+// echoed id that wasn't sent (anti-hallucination). Shared by the sync + batch paths.
+function parseExtractions(text, sentIds) {
   const result = new Map();
+  let parsed;
+  try { parsed = JSON.parse(text); } catch (e) { return result; }
   for (const e of parsed.extractions || []) {
     if (e && typeof e.ticket_id === 'string' && sentIds.has(e.ticket_id)) result.set(e.ticket_id, e);
   }
   return result;
+}
+
+// Extract one chunk of same-workflow tickets synchronously. chunk: [{uid, notes}]. wf: {name, description}.
+async function extractBatch(chunk, wf) {
+  const resp = await fetch(`${API_BASE}/api/classify`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: MODEL, max_tokens: 4096, system: buildExtractionSystem(), user: buildExtractionUser(chunk, wf), schema: EXTRACTION_SCHEMA }),
+  });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  const body = await resp.json();
+  if (!body.ok) throw new Error(body.error || 'Extraction failed');
+  return parseExtractions(body.text, new Set(chunk.map(t => t.uid)));
 }
 
 // --- Feature A, Stage 2: per-workflow reconcile (§2.1.3 / §2.2) ---
@@ -745,6 +749,76 @@ async function reconcileWorkflow(wf, agg) {
   };
 }
 
+// Extraction, in-browser worker pool. tasks: [{chunk:[{uid,notes}], wf:{name,description}}].
+// Returns {extractionsByWf: Map(name->[extraction]), exById: Map(uid->extraction)}.
+async function runExtractionSync(tasks, setStatus) {
+  const extractionsByWf = new Map(), exById = new Map();
+  let ti = 0, done = 0;
+  const up = () => setStatus(`Extracting ticket details: ${done}/${tasks.length} batches...`);
+  up();
+  async function worker() {
+    while (ti < tasks.length) {
+      if (cancelRequested) return;
+      const t = tasks[ti++];
+      try {
+        const m = await extractBatch(t.chunk, t.wf);
+        if (!extractionsByWf.has(t.wf.name)) extractionsByWf.set(t.wf.name, []);
+        for (const [uid, e] of m) { extractionsByWf.get(t.wf.name).push(e); exById.set(uid, e); }
+      } catch (err) { console.error('extract batch failed', err); }
+      done++; up();
+    }
+  }
+  await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+  return { extractionsByWf, exById };
+}
+
+// Extraction via the Batch API (scales past the relay ceiling; tab-closeable). One batch,
+// shared cached system prompt, custom_id = "t<taskIndex>" maps results back to (workflow, chunk).
+// In-session polling only (no reload-resume for the reconciliation batch yet).
+async function runExtractionBatch(tasks, setStatus) {
+  const extractionsByWf = new Map(), exById = new Map();
+  const requests = tasks.map((t, i) => ({ custom_id: `t${i}`, user: buildExtractionUser(t.chunk, t.wf) }));
+  setStatus(`Submitting ${requests.length} extraction requests to the Batch API...`);
+  const createResp = await fetch(`${API_BASE}/api/batch/create`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: MODEL, max_tokens: 4096, system: buildExtractionSystem(), schema: EXTRACTION_SCHEMA, requests }),
+  });
+  const created = await createResp.json();
+  if (!created.ok) throw new Error(created.error || 'batch create failed');
+  const batchId = created.batch_id;
+
+  while (true) {
+    if (cancelRequested) return { extractionsByWf, exById, cancelled: true };
+    let status;
+    try { const r = await fetch(`${API_BASE}/api/batch/status?id=${encodeURIComponent(batchId)}`); status = await r.json(); }
+    catch (e) { status = { ok: false, error: describeError(e) }; }
+    if (status.ok) {
+      const c = status.request_counts || {};
+      const doneN = (c.succeeded || 0) + (c.errored || 0) + (c.canceled || 0) + (c.expired || 0);
+      setStatus(`Extracting via Batch API: ${doneN}/${requests.length} (${status.processing_status}). Safe to close the tab.`);
+      if (status.processing_status === 'ended') break;
+      if (['canceled', 'canceling', 'expired'].includes(status.processing_status)) throw new Error(`extraction batch ${status.processing_status}`);
+    } else {
+      setStatus(`Batch status check failed (${status.error || 'unknown'}) — retrying...`);
+    }
+    await sleep(5000);
+  }
+
+  const resultsResp = await fetch(`${API_BASE}/api/batch/results?id=${encodeURIComponent(batchId)}`);
+  const body = await resultsResp.json();
+  if (!body.ok) throw new Error(body.error || 'batch results failed');
+  for (const res of body.results || []) {
+    const m = /^t(\d+)$/.exec(res.custom_id || '');
+    if (!m) continue;
+    const t = tasks[+m[1]];
+    if (!t || !res.ok) continue;
+    const map = parseExtractions(res.text, new Set(t.chunk.map(x => x.uid)));
+    if (!extractionsByWf.has(t.wf.name)) extractionsByWf.set(t.wf.name, []);
+    for (const [uid, e] of map) { extractionsByWf.get(t.wf.name).push(e); exById.set(uid, e); }
+  }
+  return { extractionsByWf, exById };
+}
+
 // Orchestrate Feature A: extract every classified rubric-workflow ticket (with notes),
 // then reconcile each of the rubric's workflows (all get a status; <N with notes ->
 // "Insufficient evidence", no LLM). Wired to a button + rendered in Stage 5c.
@@ -772,32 +846,25 @@ async function runReconciliation() {
   btn.disabled = true;
   const setStatus = (msg, done) => { statusEl.textContent = msg; statusEl.style.color = done ? 'var(--low)' : 'var(--text-dim)'; };
 
-  // Stage 1 — extraction (per-workflow chunks, worker pool). exById lets us surface
-  // per-ticket evidence (English + original Dutch) for the tickets the reconcile cites.
+  // Stage 1 — extraction (per-workflow chunks). exById surfaces per-ticket evidence
+  // (English + original Dutch) for the tickets the reconcile cites. Runs via the Batch
+  // API when the #useBatch toggle is on (scales past the relay ceiling), else in-browser.
   const tasks = [];
   for (const [wfName, tix] of byWorkflow) {
     const wf = { name: wfName, description: descByName.get(wfName) || '' };
     for (let i = 0; i < tix.length; i += EXTRACT_BATCH_SIZE) tasks.push({ chunk: tix.slice(i, i + EXTRACT_BATCH_SIZE), wf });
   }
-  const extractionsByWf = new Map();
-  const exById = new Map();
-  let ti = 0, exDone = 0;
-  const upEx = () => setStatus(`Extracting ticket details: ${exDone}/${tasks.length} batches...`);
-  upEx();
-  async function exWorker() {
-    while (ti < tasks.length) {
-      if (cancelRequested) return;
-      const t = tasks[ti++];
-      try {
-        const m = await extractBatch(t.chunk, t.wf);
-        if (!extractionsByWf.has(t.wf.name)) extractionsByWf.set(t.wf.name, []);
-        for (const [uid, e] of m) { extractionsByWf.get(t.wf.name).push(e); exById.set(uid, e); }
-      } catch (err) { console.error('extract batch failed', err); }
-      exDone++; upEx();
-    }
+  let extractionsByWf, exById;
+  try {
+    const useBatch = document.getElementById('useBatch').checked;
+    const res = useBatch ? await runExtractionBatch(tasks, setStatus) : await runExtractionSync(tasks, setStatus);
+    if (res.cancelled || cancelRequested) { setStatus('Reconciliation cancelled.'); btn.disabled = false; return; }
+    ({ extractionsByWf, exById } = res);
+  } catch (err) {
+    setStatus(''); btn.disabled = false;
+    showError('Extraction failed: ' + describeError(err));
+    return;
   }
-  await Promise.all(Array.from({ length: CONCURRENCY }, exWorker));
-  if (cancelRequested) { setStatus('Reconciliation cancelled.'); btn.disabled = false; return; }
 
   // Stage 2 — reconcile every rubric workflow (all get a status).
   reconciliation = new Map();
