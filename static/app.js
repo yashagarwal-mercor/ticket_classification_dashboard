@@ -1589,10 +1589,16 @@ function renderNonBillable() {
 // --- Export: clipboard TSV ---
 
 function buildTSV() {
-  const headersRow = ['Category', 'Workflow', 'Tickets', 'Total Hours', 'AHT (min)', 'FRR', 'Touches/Ticket', 'Complexity'];
+  const headersRow = ['Category', 'Workflow', 'Tickets', 'Total Hours', 'AHT (min)', 'FRR', 'Touches/Ticket', 'Complexity',
+    'Reconciliation Status', 'Observed Differences', 'Roadblock', 'Main Action', 'Cited Tickets', 'Suggested Update'];
   const lines = [headersRow.join('\t')];
+  const clean = s => String(s == null ? '' : s).replace(/[\t\r\n]+/g, ' '); // keep TSV one-row-per-record
   for (const r of window.__currentAgg || []) {
-    lines.push([r.category, r.workflow, r.tickets, r.hours.toFixed(1), r.aht.toFixed(1), (r.frr * 100).toFixed(0) + '%', r.touches.toFixed(2), r.tier].join('\t'));
+    const v = reconciliation && reconciliation.get(r.workflow);
+    const rc = v
+      ? [v.status, v.observed_differences, v.roadblock, v.main_action, (v.evidence_ticket_ids || []).join(', '), v.suggested_description_update]
+      : ['', '', '', '', '', ''];
+    lines.push([r.category, r.workflow, r.tickets, r.hours.toFixed(1), r.aht.toFixed(1), (r.frr * 100).toFixed(0) + '%', r.touches.toFixed(2), r.tier, ...rc].map(clean).join('\t'));
   }
   return lines.join('\n');
 }
@@ -1636,25 +1642,76 @@ function rowsForCompany(company) {
   return sortAggRows(agg);
 }
 
+const _xStr = v => `<Cell><Data ss:Type="String">${xmlEscape(v == null ? '' : v)}</Data></Cell>`;
+const _xNum = v => `<Cell><Data ss:Type="Number">${Number(v || 0)}</Data></Cell>`;
+const _xHdr = v => `<Cell ss:StyleID="Header"><Data ss:Type="String">${xmlEscape(v)}</Data></Cell>`;
+
+// Reconciliation cells for the Workflow Dashboard sheet (empty until reconciliation runs).
+function reconSheetCells(workflow) {
+  const v = reconciliation && reconciliation.get(workflow);
+  if (!v) return _xStr('') + _xStr('') + _xStr('') + _xStr('') + _xStr('') + _xStr('');
+  return _xStr(v.status) + _xStr(v.observed_differences) + _xStr(v.roadblock) + _xStr(v.main_action) +
+    _xStr((v.evidence_ticket_ids || []).join(', ')) + _xStr(v.suggested_description_update);
+}
+
 function sheetXML(sheetName, rows) {
   const descByName = new Map(rubric.map(r => [r.name, r.description]));
-  const hdrs = ['Category', 'Workflow', 'Description', 'Tickets', 'Total Hours', 'AHT (min)', 'FRR', 'Touches/Ticket', 'Complexity'];
-  const headerRow = '<Row>' + hdrs.map(h => `<Cell ss:StyleID="Header"><Data ss:Type="String">${xmlEscape(h)}</Data></Cell>`).join('') + '</Row>';
+  const hdrs = ['Category', 'Workflow', 'Description', 'Tickets', 'Total Hours', 'AHT (min)', 'FRR', 'Touches/Ticket', 'Complexity',
+    'Reconciliation Status', 'Observed Differences', 'Roadblock', 'Main Action', 'Cited Tickets', 'Suggested Update'];
+  const headerRow = '<Row>' + hdrs.map(_xHdr).join('') + '</Row>';
   const dataRows = rows.map(r => {
     const cells = [
-      `<Cell><Data ss:Type="String">${xmlEscape(r.category)}</Data></Cell>`,
-      `<Cell><Data ss:Type="String">${xmlEscape(r.workflow)}</Data></Cell>`,
-      `<Cell><Data ss:Type="String">${xmlEscape(descByName.get(r.workflow) || '')}</Data></Cell>`,
-      `<Cell><Data ss:Type="Number">${r.tickets}</Data></Cell>`,
-      `<Cell><Data ss:Type="Number">${r.hours.toFixed(1)}</Data></Cell>`,
+      _xStr(r.category), _xStr(r.workflow), _xStr(descByName.get(r.workflow) || ''),
+      _xNum(r.tickets), `<Cell><Data ss:Type="Number">${r.hours.toFixed(1)}</Data></Cell>`,
       `<Cell><Data ss:Type="Number">${r.aht.toFixed(1)}</Data></Cell>`,
       `<Cell><Data ss:Type="String">${(r.frr * 100).toFixed(0)}%</Data></Cell>`,
       `<Cell><Data ss:Type="Number">${r.touches.toFixed(2)}</Data></Cell>`,
-      `<Cell><Data ss:Type="String">${xmlEscape(r.tier)}</Data></Cell>`,
+      _xStr(r.tier),
+      reconSheetCells(r.workflow),
     ].join('');
     return `<Row>${cells}</Row>`;
   }).join('');
   return `<Worksheet ss:Name="${xmlEscape(sanitizeSheetName(sheetName))}"><Table>${headerRow}${dataRows}</Table></Worksheet>`;
+}
+
+// Non-Billable Pivot: Company (Label) × Workflow matrix of non-billable hours, with totals.
+function nonBillablePivotSheetXML(sheetName) {
+  const inScope = ticketRecords.filter(r => r.nonbillable_hours > 0);
+  const wfSet = new Set(), byCompany = new Map();
+  for (const r of inScope) {
+    const wf = r.workflow || '(not classified)';
+    wfSet.add(wf);
+    if (!byCompany.has(r.company)) byCompany.set(r.company, new Map());
+    const m = byCompany.get(r.company);
+    m.set(wf, (m.get(wf) || 0) + r.nonbillable_hours);
+  }
+  const workflows = [...wfSet].sort();
+  const companies = [...byCompany.keys()].sort();
+  const header = '<Row>' + _xHdr('Company (Label)') + workflows.map(_xHdr).join('') + _xHdr('Total') + '</Row>';
+  const body = companies.map(c => {
+    const m = byCompany.get(c);
+    let rowTotal = 0;
+    const cells = workflows.map(w => { const v = m.get(w) || 0; rowTotal += v; return `<Cell><Data ss:Type="Number">${v.toFixed(2)}</Data></Cell>`; }).join('');
+    return `<Row>${_xStr(c)}${cells}<Cell><Data ss:Type="Number">${rowTotal.toFixed(2)}</Data></Cell></Row>`;
+  }).join('');
+  const colTotals = workflows.map(w => { let t = 0; for (const m of byCompany.values()) t += (m.get(w) || 0); return t; });
+  const grand = colTotals.reduce((a, b) => a + b, 0);
+  const totalRow = `<Row>${_xHdr('Total')}${colTotals.map(t => `<Cell><Data ss:Type="Number">${t.toFixed(2)}</Data></Cell>`).join('')}<Cell><Data ss:Type="Number">${grand.toFixed(2)}</Data></Cell></Row>`;
+  return `<Worksheet ss:Name="${xmlEscape(sanitizeSheetName(sheetName))}"><Table>${header}${body}${totalRow}</Table></Worksheet>`;
+}
+
+// Non-Billable Detail: one flat row per in-scope ticket.
+function nonBillableDetailSheetXML(sheetName) {
+  const inScope = ticketRecords.filter(r => r.nonbillable_hours > 0);
+  const hdrs = ['Company', 'Workflow', 'Ticket', 'Total Hours', 'Non-Billable Hours', 'NB Flag', 'Contract Types', 'Roles'];
+  const header = '<Row>' + hdrs.map(_xHdr).join('') + '</Row>';
+  const body = inScope.map(r =>
+    `<Row>${_xStr(r.company)}${_xStr(r.workflow || '(not classified)')}${_xStr(r.ticket_id)}` +
+    `<Cell><Data ss:Type="Number">${(r.hours || 0).toFixed(2)}</Data></Cell>` +
+    `<Cell><Data ss:Type="Number">${(r.nonbillable_hours || 0).toFixed(2)}</Data></Cell>` +
+    `${_xStr(r.nonbillable_flag)}${_xStr((r.contract_types || []).join(', '))}${_xStr((r.roles || []).join(', '))}</Row>`
+  ).join('');
+  return `<Worksheet ss:Name="${xmlEscape(sanitizeSheetName(sheetName))}"><Table>${header}${body}</Table></Worksheet>`;
 }
 
 function buildWorkbookXML() {
@@ -1666,7 +1723,11 @@ function buildWorkbookXML() {
     usedNames.add(name);
     return name;
   };
-  let sheets = sheetXML(uniqueName('All Companies'), rowsForCompany(null));
+  let sheets = sheetXML(uniqueName('Workflow Dashboard'), rowsForCompany(null));
+  if (ticketRecords.some(r => r.nonbillable_hours > 0)) {
+    sheets += nonBillablePivotSheetXML(uniqueName('Non-Billable Pivot'));
+    sheets += nonBillableDetailSheetXML(uniqueName('Non-Billable Detail'));
+  }
   for (const company of companies) sheets += sheetXML(uniqueName(company), rowsForCompany(company));
   return `<?xml version="1.0"?>
 <?mso-application progid="Excel.Sheet"?>
@@ -1693,7 +1754,7 @@ document.getElementById('exportCsvBtn').addEventListener('click', async () => {
     downloadAttempted = true;
   } catch (e) {}
 
-  if (downloadAttempted) { showToast(`Workbook download started (${fileLabel}) — a tab per company. If Excel warns about the file format, choose "Yes, open it".`); return; }
+  if (downloadAttempted) { showToast(`Workbook download started (${fileLabel}) — Workflow Dashboard (+ reconciliation), Non-Billable Pivot & Detail, and a tab per company. If Excel warns about the file format, choose "Yes, open it".`); return; }
 
   const flat = buildTSV();
   try { await navigator.clipboard.writeText(flat); showToast('Download blocked here — copied a flattened summary to clipboard instead'); return; } catch (e) {}
