@@ -17,5 +17,6 @@ sample_data/sample_time_entries_large.csv
 # Internal spec/status docs — kept local, not tracked.
 specs/
 
-# Local diagnostic script — kept local, not tracked.
+# Local diagnostic scripts — kept local, not tracked.
 list_batches.py
+batch_durations.py
