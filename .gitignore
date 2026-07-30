@@ -12,8 +12,9 @@ sample_data/*.xls
 # Larger sample is derived from the real export (real Dutch notes) — local only.
 sample_data/sample_time_entries_large.csv
 
-# Internal spec/status doc — kept local, not tracked.
+# Internal spec/status docs — kept local, not tracked.
 IMPLEMENTATION.md
+ENT-* Requirements*.md
 
 # Local diagnostic script — kept local, not tracked.
 list_batches.py
