@@ -158,6 +158,33 @@
     </div>
   </div>
 
+  <div class="panel" id="ticketMetaPanel" style="display:none;">
+    <h2><span class="step-label">6</span>Ticket Metadata (optional) — Responsible Engineer Tier</h2>
+    <div class="hint" style="margin-bottom:12px;">Upload a ticket-level export (e.g. a TechOne "Tickets" export) that carries the support queue each ticket was worked in. Used only to derive <strong>Responsible Engineer Tier</strong> in the Playbook view — skip this if you don't have it.</div>
+    <div class="field-row" style="align-items:flex-end;">
+      <div class="field" style="flex: 2 1 320px;">
+        <label for="metaFileInput">Upload .xlsx or .csv — one row per ticket</label>
+        <input type="file" id="metaFileInput" accept=".xlsx,.xls,.csv">
+      </div>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label for="colMetaInstance">Company / instance *</label>
+        <select id="colMetaInstance"></select>
+      </div>
+      <div class="field">
+        <label for="colMetaTicketNumber">Ticket number *</label>
+        <select id="colMetaTicketNumber"></select>
+      </div>
+      <div class="field">
+        <label for="colMetaQueue">Queue / tier label *</label>
+        <select id="colMetaQueue"></select>
+      </div>
+    </div>
+    <button class="btn secondary small" id="attachMetaBtn">Attach to ticket records</button>
+    <span id="metaStatus" style="margin-left:10px; font-size:12.5px;"></span>
+  </div>
+
   <div class="error-banner" id="errorBanner"></div>
 
   <div class="panel" id="classifyPanel" style="display:none;">
@@ -182,6 +209,7 @@
     <button class="btn secondary small" id="startOverBtn">&larr; Start Over</button>
     <button class="btn small" id="viewWorkflowBtn">Workflow Dashboard</button>
     <button class="btn secondary small" id="viewNonBillableBtn">Non-Billable Analysis</button>
+    <button class="btn secondary small" id="viewPlaybookBtn">Playbook View</button>
     <div class="spacer"></div>
     <button class="btn secondary small" id="saveRunBtn" title="Download this completed run as a JSON file so it can be reloaded later without re-running the API">Save Run (JSON)</button>
     <button class="btn secondary small" id="loadRunBtn" title="Reload a previously saved run for this dataset — no API budget spent">Load Run (JSON)</button>
@@ -273,6 +301,36 @@
       <table class="dash" id="nbTable">
         <thead id="nbTableHead"></thead>
         <tbody id="nbTableBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div id="playbookView" style="display:none;">
+    <div class="controls">
+      <label for="playbookCompanyFilter">Company</label>
+      <select id="playbookCompanyFilter"></select>
+      <button class="btn small" id="buildPlaybookBtn">Build / Refresh Playbook</button>
+      <span id="playbookStatus" class="hint" style="margin-left:2px;"></span>
+      <div class="spacer"></div>
+    </div>
+    <div class="hint">One row per Company × Workflow. Description comes from your rubric; Common Steps and Responsible Tier are LLM-inferred from ticket notes and (if attached) the ticket-metadata queue field — review before treating them as authoritative. Groups with fewer than 5 notes-bearing tickets show "Insufficient evidence" instead of guessed steps. The catch-all "Unclassified / Other" bucket is excluded.</div>
+    <div class="table-scroll">
+      <table class="dash" id="playbookTable">
+        <thead>
+          <tr>
+            <th data-pbkey="company">Company</th>
+            <th data-pbkey="workflow">Workflow</th>
+            <th>Description</th>
+            <th>Common Steps</th>
+            <th data-pbkey="tier">Responsible Tier</th>
+            <th data-pbkey="tickets" class="num-cell">Tickets</th>
+            <th data-pbkey="hours" class="num-cell">Total Hours</th>
+            <th data-pbkey="frr" class="num-cell">FRR</th>
+            <th data-pbkey="touches" class="num-cell">Touches/Ticket</th>
+            <th data-pbkey="aht" class="num-cell">AHT (min)</th>
+          </tr>
+        </thead>
+        <tbody id="playbookTableBody"></tbody>
       </table>
     </div>
   </div>

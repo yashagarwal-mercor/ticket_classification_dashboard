@@ -7,6 +7,20 @@ const COVERAGE_GAP_THRESHOLD = 0.10; // >10% unclassified triggers a rubric cove
 const THEME_SAMPLE_SIZE = 40;        // # of unclassified notes sampled for theme summarization
 const API_BASE = ""; // same-origin: server.py serves both the page and /api/*
 
+// --- Playbook view (Company x Workflow: description, common steps, responsible tier) ---
+const PLAYBOOK_MIN_EVIDENCE = 5;  // groups with fewer notes-bearing tickets skip the steps call -> "Insufficient evidence"
+const PLAYBOOK_SAMPLE = 25;       // max note excerpts sent per (company, workflow) steps-synthesis call
+const TIER_LEVELS = ['Tier 1 (Front-line)', 'Tier 2 (Escalation)', 'Tier 3 (Specialist Engineering)', 'Security / SOC', 'Management / Admin', 'Sales / Account', 'Other / Unclear'];
+
+// Ticket-metadata (optional second file) column mapping — carries the support
+// queue each ticket was worked in, the source for Responsible Engineer Tier.
+const META_COL_SELECTS = { colMetaInstance: 'instance', colMetaTicketNumber: 'ticketnumber', colMetaQueue: 'queue' };
+const META_AUTODETECT = {
+  instance: ['all_tickets_tasks[instance]'],
+  ticketnumber: ['all_tickets_tasks[ticketnumber]'],
+  queue: ['ticket_queue[label]'],
+};
+
 // Time-entry column mapping: select id -> mapping key. The app accepts ONLY the
 // one-row-per-time-entry format; rows are grouped into ticket records before anything else.
 const COL_SELECTS = {
@@ -38,6 +52,10 @@ let coverageInfo = null;   // {total, unclassified, pct, noNotes, themes:[{theme
 let activeBatchId = null;  // set while a Batch API run is being polled; enables the Cancel-batch button
 let reconciliation = null;      // Map(workflowName -> verdict) from Feature A reconciliation (Phase 5)
 let citedEvidenceById = null;   // Map(uid -> {en, nl}) evidence for cited tickets (rendered + persisted)
+let metaHeaders = [];           // headers of the optional ticket-metadata file
+let metaRows = [];              // parsed rows of the optional ticket-metadata file
+let tierByQueueLabel = null;    // Map(raw queue label -> canonical tier bucket), from one-shot LLM normalization
+let playbookRows = [];          // built Playbook rows: [{company, workflow, category, tickets, hours, aht, frr, touches, tier, steps, stepsStatus}]
 
 function showError(msg) {
   const el = document.getElementById('errorBanner');
@@ -123,6 +141,7 @@ function onFileParsed() {
   document.getElementById('analyzePanel').style.display = 'block';
   document.getElementById('reviewPanel').style.display = 'block';
   document.getElementById('rubricPanel').style.display = 'block';
+  document.getElementById('ticketMetaPanel').style.display = 'block';
   document.getElementById('classifyPanel').style.display = 'block';
   if (!rubric.length) rubric = [{ name: '', category: 'General', description: '' }];
   renderRubricTable();
@@ -259,6 +278,81 @@ document.getElementById('downloadMappingBtn').addEventListener('click', () => {
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 2000);
   showToast('Mapping downloaded (column_mapping.json)');
+});
+
+// --- Ticket-metadata ingestion (optional second file) — carries the support
+// queue/tier each ticket was worked in, joined onto ticketRecords by company+ticket_id. ---
+
+function handleMetaFile(file) {
+  const reader = new FileReader();
+  const isCSV = /\.csv$/i.test(file.name);
+  reader.onload = (e) => {
+    try {
+      if (isCSV) {
+        const { headers: h, objects } = parseCSV(e.target.result);
+        metaHeaders = h; metaRows = objects;
+      } else {
+        const wb = XLSX.read(e.target.result, { type: 'array' });
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        const objects = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+        metaHeaders = objects.length ? Object.keys(objects[0]) : [];
+        metaRows = objects;
+      }
+      populateMetaSelectOptions();
+      const statusEl = document.getElementById('metaStatus');
+      statusEl.textContent = `${metaRows.length.toLocaleString()} rows, ${metaHeaders.length} columns detected — review the mapping, then Attach.`;
+      statusEl.style.color = 'var(--text-dim)';
+    } catch (err) {
+      showError('Could not parse the ticket-metadata file: ' + err.message);
+    }
+  };
+  if (isCSV) reader.readAsText(file); else reader.readAsArrayBuffer(file);
+}
+
+function populateMetaSelectOptions() {
+  const optionsHtml = '<option value="">(none)</option>' +
+    metaHeaders.map(h => `<option value="${escapeAttr(h)}">${xmlEscape(h)}</option>`).join('');
+  Object.keys(META_COL_SELECTS).forEach(id => {
+    document.getElementById(id).innerHTML = optionsHtml;
+  });
+  // Auto-detect known TechOne header names; falls back to manual selection otherwise.
+  for (const [id, key] of Object.entries(META_COL_SELECTS)) {
+    const candidates = META_AUTODETECT[key] || [];
+    const match = metaHeaders.find(h => candidates.includes(h));
+    if (match) document.getElementById(id).value = match;
+  }
+}
+
+document.getElementById('metaFileInput').addEventListener('change', (e) => {
+  if (e.target.files[0]) handleMetaFile(e.target.files[0]);
+});
+
+// Join the metadata file onto ticketRecords by company+ticketnumber, attaching a raw
+// `queue_label` string per ticket. The label is normalized into a canonical tier
+// bucket later, in runBuildPlaybook() — this step only attaches the raw value.
+document.getElementById('attachMetaBtn').addEventListener('click', () => {
+  const statusEl = document.getElementById('metaStatus');
+  if (!ticketRecords.length) { showError('Group the time-entry file into ticket records first (step 4).'); return; }
+  const instCol = document.getElementById('colMetaInstance').value;
+  const tnCol = document.getElementById('colMetaTicketNumber').value;
+  const queueCol = document.getElementById('colMetaQueue').value;
+  if (!instCol || !tnCol || !queueCol) { showError('Map all three ticket-metadata columns before attaching.'); return; }
+  showError('');
+  const byKey = new Map();
+  for (const row of metaRows) {
+    const inst = String(row[instCol] ?? '').trim();
+    const tn = String(row[tnCol] ?? '').trim();
+    if (!inst && !tn) continue;
+    byKey.set(`${inst}/${tn}`, String(row[queueCol] ?? '').trim() || null);
+  }
+  let matched = 0;
+  for (const rec of ticketRecords) {
+    const q = byKey.get(`${rec.company}/${rec.ticket_id}`);
+    if (q !== undefined) { rec.queue_label = q; if (q) matched++; }
+  }
+  tierByQueueLabel = null; // stale — Build Playbook will re-normalize against the newly attached labels
+  statusEl.textContent = `Attached — ${matched.toLocaleString()} of ${ticketRecords.length.toLocaleString()} ticket records matched a queue label.`;
+  statusEl.style.color = matched > 0 ? 'var(--low)' : 'var(--high)';
 });
 
 // --- Ticket-record grouping (time entries -> one record per instance+ticketnumber) ---
@@ -1027,6 +1121,7 @@ function applyClassifications(tickets, classifications) {
 // build dashboardRows, run the coverage-gap themes (§2.3), persist, and show the dashboard.
 async function finalizeClassification(tickets, classifications) {
   reconciliation = null; citedEvidenceById = null; // a fresh classification invalidates prior reconciliation
+  playbookRows = []; // a fresh classification invalidates prior Playbook rows (ticket-index alignment shifts)
   applyClassifications(tickets, classifications);
 
   coverageInfo = computeCoverage(dashboardRows, ticketRecords);
@@ -1100,6 +1195,7 @@ function applyEnrichedState(st) {
     const w = st.names[i];
     return { workflow: (w === CATCHALL_WORKFLOW || validNames.has(w)) ? w : CATCHALL_WORKFLOW };
   });
+  playbookRows = []; // restored classification shifts ticket-index alignment — stale Playbook rows would misalign
   applyClassifications(tickets, classifications);
   coverageInfo = (st.coverageInfo && typeof st.coverageInfo === 'object') ? st.coverageInfo : null;
   reconciliation = Array.isArray(st.reconciliation) ? new Map(st.reconciliation) : null;
@@ -1629,14 +1725,18 @@ function showDashboard() {
 
 function setDashboardView(view) {
   const isNb = view === 'nonbillable';
-  document.getElementById('workflowView').style.display = isNb ? 'none' : 'block';
+  const isPb = view === 'playbook';
+  document.getElementById('workflowView').style.display = (isNb || isPb) ? 'none' : 'block';
   document.getElementById('nonBillableView').style.display = isNb ? 'block' : 'none';
-  // Workflow-specific export buttons only make sense on the workflow view (NB export lands in Phase 5).
-  document.getElementById('exportCsvBtn').style.display = isNb ? 'none' : '';
-  document.getElementById('exportBtn').style.display = isNb ? 'none' : '';
-  document.getElementById('viewWorkflowBtn').className = 'btn small' + (isNb ? ' secondary' : '');
+  document.getElementById('playbookView').style.display = isPb ? 'block' : 'none';
+  // Workflow-specific export buttons only make sense on the workflow view (NB/Playbook export their own way).
+  document.getElementById('exportCsvBtn').style.display = (isNb || isPb) ? 'none' : '';
+  document.getElementById('exportBtn').style.display = (isNb || isPb) ? 'none' : '';
+  document.getElementById('viewWorkflowBtn').className = 'btn small' + (isNb || isPb ? ' secondary' : '');
   document.getElementById('viewNonBillableBtn').className = 'btn small' + (isNb ? '' : ' secondary');
+  document.getElementById('viewPlaybookBtn').className = 'btn small' + (isPb ? '' : ' secondary');
   if (isNb) renderNonBillable();
+  if (isPb) renderPlaybook();
 }
 
 // Reachable straight after grouping (no classification / no API calls).
@@ -1655,6 +1755,11 @@ document.getElementById('viewWorkflowBtn').addEventListener('click', () => {
 });
 document.getElementById('viewNonBillableBtn').addEventListener('click', () => setDashboardView('nonbillable'));
 document.getElementById('nonBillableBtn').addEventListener('click', showNonBillable);
+document.getElementById('viewPlaybookBtn').addEventListener('click', () => {
+  if (!dashboardRows.length) { showError('Classify tickets first to build the Playbook view.'); return; }
+  showError('');
+  setDashboardView('playbook');
+});
 
 // --- Feature B: non-billable analysis (aggregation over ticket records, no LLM) ---
 
@@ -1768,6 +1873,237 @@ function renderNonBillable() {
 ['nbCompanyFilter', 'nbGroupBy', 'nbScope'].forEach(id => {
   document.getElementById(id).addEventListener('change', renderNonBillable);
 });
+
+// --- Playbook view: Company x Workflow rows with description, common steps,
+// responsible engineer tier, and the existing volume/quality metrics. ---
+
+const TIER_SCHEMA = {
+  type: "object",
+  properties: {
+    mappings: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          queue_label: { type: "string" },
+          tier: { type: "string", enum: TIER_LEVELS },
+        },
+        required: ["queue_label", "tier"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["mappings"],
+  additionalProperties: false,
+};
+
+function buildTierSystem() {
+  return `You are normalizing an MSP's raw support-ticket queue/team labels (mostly Dutch, inconsistent per company) into a standard support-tier taxonomy. For each distinct label given, pick the single best-matching bucket from: ${TIER_LEVELS.join(', ')}.
+
+Guidance:
+- "1e lijn" / "1ste lijn" / "Servicedesk 1e lijn" / "Level I" / first-line service-desk labels -> Tier 1 (Front-line).
+- "2e lijn" / "2de lijn" -> Tier 2 (Escalation).
+- "3e lijn" / "System Engineering" -> Tier 3 (Specialist Engineering).
+- "SOC" / "Security" / "Monitoring" / "Vulnerability" / "Back-up" alerting queues -> Security / SOC.
+- "Beheer" / "Beheerafspraak" / "Administratie" / "Planning" / "Intake/dispatching" -> Management / Admin.
+- "Sales" / "Inside Sales" / "Post Sale" -> Sales / Account.
+- Numbered color codes (e.g. "2. Groen", "3. Blauw", "4. Rood") are a company-specific severity/tier ladder, not a literal team name — if the sequence clearly implies ascending tiers, map low numbers to Tier 1 and high numbers to Tier 3; otherwise use Other / Unclear.
+- Anything you cannot confidently place -> Other / Unclear. Do not guess beyond what the label plausibly means.
+
+Echo each queue_label EXACTLY as given. Return exactly one mapping per input label.`;
+}
+
+async function normalizeQueueTiers(labels) {
+  if (!labels.length) return new Map();
+  const user = `Distinct queue/team labels (${labels.length}):\n${labels.map(l => `- ${l}`).join('\n')}`;
+  const resp = await fetch(`${API_BASE}/api/classify`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: MODEL_SUMMARY, max_tokens: 4096, system: buildTierSystem(), user, schema: TIER_SCHEMA }),
+  });
+  const body = await resp.json();
+  if (!body.ok) throw new Error(body.error || 'Tier normalization failed');
+  const parsed = JSON.parse(body.text);
+  const known = new Set(labels);
+  const map = new Map();
+  for (const m of parsed.mappings || []) {
+    if (known.has(m.queue_label) && TIER_LEVELS.includes(m.tier)) map.set(m.queue_label, m.tier);
+  }
+  return map;
+}
+
+function ticketTier(rec) {
+  if (!rec || !rec.queue_label || !tierByQueueLabel) return 'Unknown';
+  return tierByQueueLabel.get(rec.queue_label) || 'Unknown';
+}
+
+// Group classified tickets by (company, workflow). Mirrors aggregateRows() (which groups
+// by workflow only) but adds the dominant Responsible Engineer Tier per group and excludes
+// the catch-all bucket (no rubric description/steps make sense for "Unclassified / Other").
+// Also returns, per group, the ticketRecords indices needed to sample notes for steps synthesis.
+function aggregatePlaybookGroups() {
+  const byKey = new Map(); // "company␟workflow" -> group
+  for (let i = 0; i < dashboardRows.length; i++) {
+    const r = dashboardRows[i];
+    if (r.workflow === CATCHALL_WORKFLOW) continue;
+    const key = r.company + '␟' + r.workflow;
+    let g = byKey.get(key);
+    if (!g) {
+      g = { company: r.company, workflow: r.workflow, category: r.category, tickets: 0, hours: 0, touches: 0, first_touch: 0, tierCounts: {}, recordIdx: [] };
+      byKey.set(key, g);
+    }
+    g.tickets += r.ticketCount; g.hours += r.hours; g.touches += r.touches; g.first_touch += r.first_touch;
+    const tier = ticketTier(ticketRecords[i]);
+    g.tierCounts[tier] = (g.tierCounts[tier] || 0) + 1;
+    g.recordIdx.push(i);
+  }
+  const out = [];
+  for (const g of byKey.values()) {
+    const aht = g.tickets > 0 ? (g.hours / g.tickets) * 60 : 0;
+    const frr = g.tickets > 0 ? g.first_touch / g.tickets : 0;
+    const touchesPerTicket = g.tickets > 0 ? g.touches / g.tickets : 0;
+    let tier = 'Unknown', tierN = -1;
+    for (const [t, n] of Object.entries(g.tierCounts)) if (n > tierN) { tier = t; tierN = n; }
+    out.push({ company: g.company, workflow: g.workflow, category: g.category, tickets: g.tickets, hours: g.hours, aht, frr, touches: touchesPerTicket, tier, recordIdx: g.recordIdx });
+  }
+  return out;
+}
+
+const STEPS_SCHEMA = {
+  type: "object",
+  properties: {
+    common_steps: { type: "array", items: { type: "string" }, minItems: 3, maxItems: 5 },
+  },
+  required: ["common_steps"],
+  additionalProperties: false,
+};
+
+function buildStepsSystem() {
+  return `You are summarizing how engineers ACTUALLY resolve helpdesk tickets in one workflow, for one company, based on raw time-entry notes (mostly Dutch — reason over them directly, do NOT pre-translate). Identify the common sequence of steps engineers take across these tickets and return between 3 and 5 concise, ordered, English steps (e.g. "Verify user identity", "Reset password in Entra ID", "Confirm resolution with customer"). Base this ONLY on patterns visible across MULTIPLE tickets in the input — never invent a step that isn't evidenced in the notes. If the tickets show genuinely different processes, describe the single most common path.`;
+}
+
+function buildStepsUser(company, wf, sampleNotes) {
+  const bundles = sampleNotes.map((n, i) => `Ticket ${i + 1}:\n${n.replace(/\s+/g, ' ').slice(0, 800)}`).join('\n\n');
+  return `Company: ${company}\nWorkflow: "${wf.name}"\nWorkflow description: "${wf.description}"\n\nSample ticket notes (${sampleNotes.length} of them):\n\n${bundles}`;
+}
+
+async function synthesizeSteps(company, wf, sampleNotes) {
+  const resp = await fetch(`${API_BASE}/api/classify`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: MODEL, max_tokens: 1024, system: buildStepsSystem(), user: buildStepsUser(company, wf, sampleNotes), schema: STEPS_SCHEMA }),
+  });
+  const body = await resp.json();
+  if (!body.ok) throw new Error(body.error || 'Steps synthesis failed');
+  return (JSON.parse(body.text).common_steps) || [];
+}
+
+// Orchestrate the Playbook build: normalize queue-label tiers (once, if ticket metadata was
+// attached), aggregate by (company, workflow), then synthesize common steps per group with
+// enough evidence (concurrency-limited worker pool, mirrors runReconciliation's shape).
+async function runBuildPlaybook() {
+  if (!dashboardRows.length) { showError('Classify tickets first, then build the Playbook.'); return; }
+  showError('');
+  const statusEl = document.getElementById('playbookStatus');
+  const btn = document.getElementById('buildPlaybookBtn');
+  btn.disabled = true;
+  const setStatus = (msg, done) => { statusEl.textContent = msg; statusEl.style.color = done ? 'var(--low)' : 'var(--text-dim)'; };
+
+  if (!tierByQueueLabel) {
+    const labels = Array.from(new Set(ticketRecords.map(r => r.queue_label).filter(Boolean)));
+    if (labels.length) {
+      setStatus(`Normalizing ${labels.length} queue label(s) into support tiers...`);
+      try { tierByQueueLabel = await normalizeQueueTiers(labels); }
+      catch (err) { showError('Tier normalization failed (tiers will show "Unknown"): ' + describeError(err)); tierByQueueLabel = new Map(); }
+    } else {
+      tierByQueueLabel = new Map(); // no ticket metadata attached — every group shows "Unknown"
+    }
+  }
+
+  const descByName = new Map(rubric.map(r => [r.name, r.description]));
+  const groups = aggregatePlaybookGroups();
+  const tasks = groups
+    .map((g, gi) => ({ g, gi, notes: g.recordIdx.map(i => ticketRecords[i]).filter(r => r.has_notes) }))
+    .filter(t => t.notes.length >= PLAYBOOK_MIN_EVIDENCE);
+  for (const g of groups) { g.steps = []; g.stepsStatus = 'Insufficient evidence'; }
+
+  let ti = 0, done = 0;
+  const upSteps = () => setStatus(`Synthesizing common steps: ${done}/${tasks.length} groups (${groups.length - tasks.length} skipped — insufficient evidence)...`);
+  upSteps();
+  async function worker() {
+    while (ti < tasks.length) {
+      const t = tasks[ti++];
+      const wf = { name: t.g.workflow, description: descByName.get(t.g.workflow) || '' };
+      const sample = t.notes.slice(0, PLAYBOOK_SAMPLE).map(r => r.notes);
+      try {
+        t.g.steps = await synthesizeSteps(t.g.company, wf, sample);
+        t.g.stepsStatus = 'Generated';
+      } catch (err) {
+        t.g.stepsStatus = 'Failed: ' + describeError(err);
+      }
+      done++; upSteps();
+    }
+  }
+  await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+
+  playbookRows = groups.map(g => ({ ...g, description: descByName.get(g.workflow) || '' }));
+  btn.disabled = false;
+  setStatus(`Playbook built — ${playbookRows.length} company × workflow row(s), ${tasks.length} with synthesized steps.`, true);
+  renderPlaybook();
+}
+
+let playbookSortKey = 'tickets';
+let playbookSortDir = -1;
+
+function populatePlaybookCompanyFilter() {
+  const el = document.getElementById('playbookCompanyFilter');
+  const prev = el.value;
+  const companies = Array.from(new Set(playbookRows.map(r => r.company))).sort();
+  el.innerHTML = '<option value="all">All Companies</option>' + companies.map(c => `<option value="${escapeAttr(c)}">${xmlEscape(c)}</option>`).join('');
+  el.value = companies.includes(prev) ? prev : 'all';
+}
+
+const PLAYBOOK_TIER_CLASS = {
+  'Tier 1 (Front-line)': 'tier-low', 'Tier 2 (Escalation)': 'tier-medium', 'Tier 3 (Specialist Engineering)': 'tier-high',
+};
+
+function renderPlaybook() {
+  populatePlaybookCompanyFilter();
+  const company = document.getElementById('playbookCompanyFilter').value;
+  let rows = company === 'all' ? playbookRows : playbookRows.filter(r => r.company === company);
+  rows = rows.slice().sort((a, b) => {
+    const va = a[playbookSortKey], vb = b[playbookSortKey];
+    if (typeof va === 'string') return va.localeCompare(vb) * playbookSortDir;
+    return (va - vb) * playbookSortDir;
+  });
+  document.getElementById('playbookTableBody').innerHTML = rows.map(r => {
+    const tierCls = PLAYBOOK_TIER_CLASS[r.tier] || '';
+    const stepsHtml = r.steps && r.steps.length
+      ? '<ol class="steps-list">' + r.steps.map(s => `<li>${xmlEscape(s)}</li>`).join('') + '</ol>'
+      : `<span class="steps-empty">${xmlEscape(r.stepsStatus || 'Insufficient evidence')}</span>`;
+    return `<tr>
+      <td>${xmlEscape(r.company)}</td>
+      <td class="wf-name"><div class="wf-cell">${xmlEscape(r.workflow)}</div></td>
+      <td><div class="wf-desc" style="max-width:260px;">${xmlEscape(r.description || '')}</div></td>
+      <td><div class="steps-cell">${stepsHtml}</div></td>
+      <td>${tierCls ? `<span class="tier ${tierCls}">${xmlEscape(r.tier)}</span>` : `<span class="tier tier-neutral">${xmlEscape(r.tier)}</span>`}</td>
+      <td class="num-cell">${r.tickets.toLocaleString()}</td>
+      <td class="num-cell">${r.hours.toLocaleString(undefined, {maximumFractionDigits: 1})}</td>
+      <td class="num-cell">${(r.frr * 100).toFixed(0)}%</td>
+      <td class="num-cell">${r.touches.toFixed(2)}</td>
+      <td class="num-cell">${r.aht.toFixed(1)}</td>
+    </tr>`;
+  }).join('') || `<tr><td colspan="10" style="text-align:center; color:var(--text-dim);">No Playbook rows yet — click "Build / Refresh Playbook".</td></tr>`;
+}
+
+document.querySelectorAll('#playbookTable thead th').forEach(th => {
+  th.addEventListener('click', () => {
+    const key = th.dataset.pbkey;
+    if (!key) return;
+    if (playbookSortKey === key) playbookSortDir *= -1; else { playbookSortKey = key; playbookSortDir = -1; }
+    renderPlaybook();
+  });
+});
+document.getElementById('playbookCompanyFilter').addEventListener('change', renderPlaybook);
+document.getElementById('buildPlaybookBtn').addEventListener('click', runBuildPlaybook);
 
 // --- Export: clipboard TSV ---
 
@@ -1906,7 +2242,7 @@ function nonBillablePivotSheetXML(sheetName) {
 // Non-Billable Detail: one flat row per in-scope ticket.
 function nonBillableDetailSheetXML(sheetName) {
   const inScope = ticketRecords.filter(r => r.nonbillable_hours > 0);
-  const hdrs = ['Company', 'Workflow', 'Ticket', 'Total Hours', 'Non-Billable Hours', 'NB Flag', 'Contract Types', 'Roles'];
+  const hdrs = ['Company (Label)', 'Workflow', 'Ticket', 'Total Hours', 'Non-Billable Hours', 'NB Flag', 'Contract Types', 'Roles'];
   const header = '<Row>' + hdrs.map(_xHdr).join('') + '</Row>';
   const body = inScope.map(r =>
     `<Row>${_xStr(r.company)}${_xStr(r.workflow || '(not classified)')}${_xStr(r.ticket_id)}` +
@@ -1914,6 +2250,35 @@ function nonBillableDetailSheetXML(sheetName) {
     `<Cell><Data ss:Type="Number">${(r.nonbillable_hours || 0).toFixed(2)}</Data></Cell>` +
     `${_xStr(r.nonbillable_flag)}${_xStr((r.contract_types || []).join(', '))}${_xStr((r.roles || []).join(', '))}</Row>`
   ).join('');
+  return `<Worksheet ss:Name="${xmlEscape(sanitizeSheetName(sheetName))}"><Table>${header}${body}</Table></Worksheet>`;
+}
+
+// Ticket Detail sheet: one flat row per ticket (unfiltered) — ticket id, company,
+// workflow, hours, touches. Workflow falls back to "(not classified)" pre-classification.
+function ticketDetailSheetXML(sheetName) {
+  const hdrs = ['Ticket ID', 'Company (Label)', 'Workflow', 'Total Hours', 'Touches'];
+  const header = '<Row>' + hdrs.map(_xHdr).join('') + '</Row>';
+  const body = ticketRecords.map(r =>
+    `<Row>${_xStr(r.ticket_id)}${_xStr(r.company)}${_xStr(r.workflow || '(not classified)')}` +
+    `<Cell><Data ss:Type="Number">${(r.hours || 0).toFixed(2)}</Data></Cell>` +
+    `<Cell><Data ss:Type="Number">${r.touches || 0}</Data></Cell></Row>`
+  ).join('');
+  return `<Worksheet ss:Name="${xmlEscape(sanitizeSheetName(sheetName))}"><Table>${header}${body}</Table></Worksheet>`;
+}
+
+// Playbook sheet: one row per Company x Workflow, mirrors the Playbook view columns.
+function playbookSheetXML(sheetName) {
+  const hdrs = ['Company (Label)', 'Workflow', 'Description', 'Common Steps', 'Responsible Tier', 'Tickets', 'Total Hours', 'FRR', 'Touches/Ticket', 'AHT (min)'];
+  const header = '<Row>' + hdrs.map(_xHdr).join('') + '</Row>';
+  const body = playbookRows.map(r => {
+    const stepsText = (r.steps && r.steps.length) ? r.steps.map((s, i) => `${i + 1}. ${s}`).join('\n') : (r.stepsStatus || 'Insufficient evidence');
+    return `<Row>${_xStr(r.company)}${_xStr(r.workflow)}${_xStr(r.description || '')}${_xStr(stepsText)}${_xStr(r.tier)}` +
+      `<Cell><Data ss:Type="Number">${r.tickets}</Data></Cell>` +
+      `<Cell><Data ss:Type="Number">${r.hours.toFixed(1)}</Data></Cell>` +
+      `<Cell><Data ss:Type="String">${(r.frr * 100).toFixed(0)}%</Data></Cell>` +
+      `<Cell><Data ss:Type="Number">${r.touches.toFixed(2)}</Data></Cell>` +
+      `<Cell><Data ss:Type="Number">${r.aht.toFixed(1)}</Data></Cell></Row>`;
+  }).join('');
   return `<Worksheet ss:Name="${xmlEscape(sanitizeSheetName(sheetName))}"><Table>${header}${body}</Table></Worksheet>`;
 }
 
@@ -1927,10 +2292,12 @@ function buildWorkbookXML() {
     return name;
   };
   let sheets = sheetXML(uniqueName('Workflow Dashboard'), rowsForCompany(null));
+  sheets += ticketDetailSheetXML(uniqueName('Ticket Detail'));
   if (ticketRecords.some(r => r.nonbillable_hours > 0)) {
     sheets += nonBillablePivotSheetXML(uniqueName('Non-Billable Pivot'));
     sheets += nonBillableDetailSheetXML(uniqueName('Non-Billable Detail'));
   }
+  if (playbookRows.length) sheets += playbookSheetXML(uniqueName('Playbook'));
   for (const company of companies) sheets += sheetXML(uniqueName(company), rowsForCompany(company));
   return `<?xml version="1.0"?>
 <?mso-application progid="Excel.Sheet"?>
@@ -1964,7 +2331,7 @@ document.getElementById('exportCsvBtn').addEventListener('click', async () => {
     downloadAttempted = true;
   } catch (e) {}
 
-  if (downloadAttempted) { showToast(`Workbook download started (${fileLabel}) — Workflow Dashboard (+ reconciliation), Non-Billable Pivot & Detail, and a tab per company. If Excel warns about the file format, choose "Yes, open it".`); return; }
+  if (downloadAttempted) { showToast(`Workbook download started (${fileLabel}) — Workflow Dashboard (+ reconciliation), Ticket Detail, Non-Billable Pivot & Detail${playbookRows.length ? ', Playbook' : ''}, and a tab per company. If Excel warns about the file format, choose "Yes, open it".`); return; }
 
   const flat = buildTSV();
   try { await navigator.clipboard.writeText(flat); showToast('Download blocked here — copied a flattened summary to clipboard instead'); return; } catch (e) {}
