@@ -53,9 +53,11 @@ INFER_MODEL = "claude-opus-4-8"
 # to the browser stays bounded (mirrors META_DESC_CAP in app.js).
 META_DESC_CAP = 4000
 
-# Anthropic batch ids look like "msgbatch_...". Validate before passing a
-# client-supplied id to the SDK (guards against parameter injection).
-BATCH_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+# Anthropic batch ids look like "msgbatch_...". Require that exact prefix before
+# passing a client-supplied id to the SDK: guards against parameter injection AND
+# rejects stale/garbage ids locally (with a clear error) instead of proxying a
+# doomed request to Anthropic, which is what let a bad id spin the poll loop.
+BATCH_ID_RE = re.compile(r"^msgbatch_[A-Za-z0-9_-]{1,119}$")
 
 _MAPPING_FIELDS = [
     "instance_column", "ticketnumber_column", "startdate_column",

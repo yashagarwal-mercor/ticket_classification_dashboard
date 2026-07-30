@@ -1,6 +1,10 @@
 const MODEL = "claude-sonnet-5"; // bulk classification, reconciliation extraction, Playbook steps
 const MODEL_SUMMARY = "claude-sonnet-5"; // one-shot quality tasks (theme summary, reconciliation)
 const BATCH_SIZE = 12;      // notes bundles are long (full Dutch email threads) — smaller batches than the old 30
+// The Batch API caps a single submission at 256MB. In the batch JSONL the rubric system
+// prompt is repeated per request, so a full run's requests are split across several batches,
+// each kept under this budget (headroom left for UTF-8/JSON-escaping inflation).
+const MAX_BATCH_BYTES = 150 * 1024 * 1024;
 const CONCURRENCY = 5;
 const CATCHALL_WORKFLOW = "Unclassified / Other";
 const COVERAGE_GAP_THRESHOLD = 0.10; // >10% unclassified triggers a rubric coverage-gap warning (§2.3)
@@ -59,7 +63,7 @@ let rubric = [];           // [{name, category, description}]
 let cancelRequested = false;
 let dashboardRows = [];    // [{company, workflow, category, hours, touches, first_touch}]
 let coverageInfo = null;   // {total, unclassified, pct, noNotes, themes:[{theme,description,examples}]} — §2.3 coverage gap
-let activeBatchId = null;  // set while a Batch API run is being polled; enables the Cancel-batch button
+let activeBatchIds = [];   // batch ids currently being polled (a run is split across several); enables Cancel-batch
 let reconciliation = null;      // Map(workflowName -> verdict) from Feature A reconciliation (Phase 5)
 let citedEvidenceById = null;   // Map(uid -> {en, nl}) evidence for cited tickets (rendered + persisted)
 let metaHeaders = [];           // headers of the optional Tickets export (for the mapping dropdowns)
@@ -162,7 +166,8 @@ function onFileParsed() {
   const pending = loadBatchState();
   const hint = document.getElementById('batchResumeHint');
   if (pending) {
-    hint.textContent = `A classification batch (${pending.batch_id}) is in progress — Group the same file to resume watching it.`;
+    const ids = pending.batch_ids || (pending.batch_id ? [pending.batch_id] : []);
+    hint.textContent = `A classification run (${ids.length} batch${ids.length === 1 ? '' : 'es'}) is in progress — Group the same file to resume watching it.`;
     hint.style.display = 'inline';
   } else {
     hint.style.display = 'none';
@@ -937,6 +942,7 @@ async function runExtractionBatch(tasks, setStatus) {
       if (status.processing_status === 'ended') break;
       if (['canceled', 'canceling', 'expired'].includes(status.processing_status)) throw new Error(`extraction batch ${status.processing_status}`);
     } else {
+      if (isPermanentBatchError(status.error)) throw new Error(`extraction batch tracking failed — invalid batch id (${status.error || ''})`);
       setStatus(`Batch status check failed (${status.error || 'unknown'}) — retrying...`);
     }
     await sleep(5000);
@@ -1382,11 +1388,27 @@ async function runClassification() {
 
 const BATCH_LS_KEY = 'ent1998_pending_batch';
 function datasetFingerprint() { return `${ticketRecords.length}:${parsedRows.length}:${headers.length}`; }
-function saveBatchState(batchId) {
-  try { localStorage.setItem(BATCH_LS_KEY, JSON.stringify({ batch_id: batchId, fingerprint: datasetFingerprint() })); } catch (e) {}
+function saveBatchState(batchIds) {
+  try { localStorage.setItem(BATCH_LS_KEY, JSON.stringify({ batch_ids: batchIds, fingerprint: datasetFingerprint() })); } catch (e) {}
 }
 function loadBatchState() { try { return JSON.parse(localStorage.getItem(BATCH_LS_KEY) || 'null'); } catch (e) { return null; } }
 function clearBatchState() { try { localStorage.removeItem(BATCH_LS_KEY); } catch (e) {} }
+
+// Split classification requests into groups small enough for the Batch API's 256MB limit.
+// The system prompt is repeated per request in the batch JSONL, so each request's expanded
+// weight includes it; we greedily fill a group until the next request would exceed the budget.
+function partitionRequests(requests, systemText, schema) {
+  const perReq = systemText.length + JSON.stringify(schema).length + 600; // system repeated + schema + envelope
+  const groups = [];
+  let cur = [], curBytes = 0;
+  for (const r of requests) {
+    const rBytes = perReq + (r.user ? r.user.length : 0) + (r.custom_id ? r.custom_id.length : 0);
+    if (cur.length && curBytes + rBytes > MAX_BATCH_BYTES) { groups.push(cur); cur = []; curBytes = 0; }
+    cur.push(r); curBytes += rBytes;
+  }
+  if (cur.length) groups.push(cur);
+  return groups;
+}
 
 async function runBatchClassification() {
   cancelRequested = false;
@@ -1397,36 +1419,52 @@ async function runBatchClassification() {
 
   const tickets = buildTicketsForClassification();
   const chunks = chunkTickets(tickets);
+  const system = buildSystemPrompt();
+  // custom_id encodes the GLOBAL chunk index, so results map back correctly no matter
+  // which sub-batch they come from.
   const requests = chunks.map((chunk, i) => ({ custom_id: `c${i}`, user: buildUserPrompt(chunk) }));
+  const groups = partitionRequests(requests, system, RESPONSE_SCHEMA);
 
   document.getElementById('classifyBtn').disabled = true;
   document.getElementById('progressWrap').style.display = 'block';
   document.getElementById('progressBarInner').style.width = '0%';
-  document.getElementById('progressText').textContent =
-    `Submitting ${requests.length.toLocaleString()} requests to the Batch API...`;
 
-  let batchId;
+  const batchIds = [];
   try {
-    const resp = await fetch(`${API_BASE}/api/batch/create`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: MODEL, max_tokens: 4096, system: buildSystemPrompt(), schema: RESPONSE_SCHEMA, requests }),
-    });
-    const body = await resp.json();
-    if (!body.ok) throw new Error(body.error || 'Batch create failed');
-    batchId = body.batch_id;
+    for (let gi = 0; gi < groups.length; gi++) {
+      document.getElementById('progressText').textContent =
+        `Submitting batch ${gi + 1} of ${groups.length} (${groups[gi].length.toLocaleString()} requests)...`;
+      const resp = await fetch(`${API_BASE}/api/batch/create`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: MODEL, max_tokens: 4096, system, schema: RESPONSE_SCHEMA, requests: groups[gi] }),
+      });
+      const body = await resp.json();
+      if (!body.ok) throw new Error(body.error || 'Batch create failed');
+      batchIds.push(body.batch_id);
+    }
   } catch (err) {
+    // Best-effort cancel of any batches already created, so a mid-way failure doesn't leave orphaned spend.
+    for (const id of batchIds) {
+      try { await fetch(`${API_BASE}/api/batch/cancel`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ batch_id: id }) }); } catch (e) {}
+    }
     document.getElementById('progressWrap').style.display = 'none';
     document.getElementById('classifyBtn').disabled = false;
     showError('Could not start the batch: ' + describeError(err));
     return;
   }
-  saveBatchState(batchId);
-  await pollBatchToCompletion(batchId, tickets, chunks);
+  saveBatchState(batchIds);
+  await pollBatchesToCompletion(batchIds, tickets, chunks);
 }
 
-// Poll a batch to completion, then map results back by custom_id and finalize.
+// A batch status/results error that will never succeed on retry (bad/stale/garbage id),
+// vs a transient network blip. Used to break the poll loop instead of retrying forever.
+function isPermanentBatchError(err) {
+  return typeof err === 'string' && /invalid|msgbatch|not[ _]?found|\b400\b/i.test(err);
+}
+
+// Poll every batch of a run to completion, then merge results back by custom_id and finalize.
 // Reused by the resume path after a page reload.
-async function pollBatchToCompletion(batchId, tickets, chunks) {
+async function pollBatchesToCompletion(batchIds, tickets, chunks) {
   const validNames = new Set(rubric.map(r => r.name));
   const total = chunks.length;
   const bar = document.getElementById('progressBarInner');
@@ -1434,10 +1472,10 @@ async function pollBatchToCompletion(batchId, tickets, chunks) {
   const cancelBtn = document.getElementById('cancelBtn');
   document.getElementById('progressWrap').style.display = 'block';
   document.getElementById('classifyBtn').disabled = true;
-  activeBatchId = batchId;              // enables the Cancel-batch handler
+  activeBatchIds = batchIds.slice();   // enables the Cancel-batch handler
   cancelBtn.textContent = 'Cancel batch';
   const endPoll = () => {
-    activeBatchId = null;
+    activeBatchIds = [];
     cancelBtn.textContent = 'Cancel';
     document.getElementById('progressWrap').style.display = 'none';
     document.getElementById('classifyBtn').disabled = false;
@@ -1445,63 +1483,69 @@ async function pollBatchToCompletion(batchId, tickets, chunks) {
 
   while (true) {
     if (cancelRequested) { endPoll(); return; } // the Cancel-batch handler owns the cancel call + message
-    let status;
-    try {
-      const resp = await fetch(`${API_BASE}/api/batch/status?id=${encodeURIComponent(batchId)}`);
-      status = await resp.json();
-    } catch (err) { status = { ok: false, error: describeError(err) }; }
-
-    if (status.ok) {
-      const c = status.request_counts || {};
-      const done = (c.succeeded || 0) + (c.errored || 0) + (c.canceled || 0) + (c.expired || 0);
-      const pct = total > 0 ? Math.round(done / total * 100) : 0;
-      bar.style.width = pct + '%';
-      text.textContent = `Batch classifying: ${done.toLocaleString()} / ${total.toLocaleString()} requests (${pct}%) — ${status.processing_status}. Safe to close the tab.`;
-      if (status.processing_status === 'ended') break;
-      if (['canceled', 'canceling', 'expired'].includes(status.processing_status)) {
-        endPoll(); clearBatchState();
-        showError(`Batch ${status.processing_status}.`);
-        return;
+    let done = 0, allEnded = true, badStatus = null, anyError = false, fatalError = null;
+    for (const id of batchIds) {
+      let status;
+      try {
+        const resp = await fetch(`${API_BASE}/api/batch/status?id=${encodeURIComponent(id)}`);
+        status = await resp.json();
+      } catch (err) { status = { ok: false, error: describeError(err) }; }
+      if (status.ok) {
+        const c = status.request_counts || {};
+        done += (c.succeeded || 0) + (c.errored || 0) + (c.canceled || 0) + (c.expired || 0);
+        if (status.processing_status !== 'ended') allEnded = false;
+        if (['canceled', 'canceling', 'expired'].includes(status.processing_status)) badStatus = status.processing_status;
+      } else {
+        allEnded = false; anyError = true;
+        if (isPermanentBatchError(status.error)) fatalError = status.error;
       }
-    } else {
-      text.textContent = `Batch status check failed (${status.error || 'unknown'}) — retrying...`;
     }
+    const pct = total > 0 ? Math.round(done / total * 100) : 0;
+    bar.style.width = pct + '%';
+    // A permanent error (invalid/stale id) will never recover — stop and clear the state
+    // instead of looping "retrying..." forever.
+    if (fatalError) { endPoll(); clearBatchState(); showError(`Stopped watching the batch — invalid or stale batch reference (${fatalError}). Re-run classification.`); return; }
+    if (badStatus) { endPoll(); clearBatchState(); showError(`Batch ${badStatus}.`); return; }
+    text.textContent = anyError
+      ? `Batch status check failed — retrying...`
+      : `Batch classifying: ${done.toLocaleString()} / ${total.toLocaleString()} requests (${pct}%) across ${batchIds.length} batch${batchIds.length === 1 ? '' : 'es'}. Safe to close the tab.`;
+    if (allEnded) break;
     await sleep(5000);
   }
 
-  text.textContent = 'Batch complete — downloading results...';
-  let body;
+  text.textContent = 'Batches complete — downloading results...';
+  const classifications = new Array(tickets.length).fill(null);
   try {
-    const resp = await fetch(`${API_BASE}/api/batch/results?id=${encodeURIComponent(batchId)}`);
-    body = await resp.json();
-    if (!body.ok) throw new Error(body.error || 'Batch results failed');
+    for (const id of batchIds) {
+      const resp = await fetch(`${API_BASE}/api/batch/results?id=${encodeURIComponent(id)}`);
+      const body = await resp.json();
+      if (!body.ok) throw new Error(body.error || 'Batch results failed');
+      if (body.usage) console.log('Batch cache usage:', id, body.usage);
+      for (const r of body.results || []) {
+        const m = /^c(\d+)$/.exec(r.custom_id || '');
+        if (!m) continue;
+        const chunkIdx = +m[1];
+        const chunk = chunks[chunkIdx];
+        if (!chunk || !r.ok) continue;
+        const offset = chunkIdx * BATCH_SIZE;
+        let parsed;
+        try { parsed = JSON.parse(r.text); } catch (e) { continue; }
+        for (const item of parsed.classifications || []) {
+          if (item.index == null || item.index >= chunk.length) continue;
+          let wf = item.workflow;
+          if (wf !== 'NONE' && !validNames.has(wf)) wf = 'NONE';
+          classifications[offset + item.index] = { workflow: wf, confidence: item.confidence };
+        }
+      }
+    }
   } catch (err) {
     endPoll();
     showError('Could not download batch results: ' + describeError(err));
     return;
   }
-  if (body.usage) console.log('Batch cache usage:', body.usage);
-
-  const classifications = new Array(tickets.length).fill(null);
-  for (const r of body.results || []) {
-    const m = /^c(\d+)$/.exec(r.custom_id || '');
-    if (!m) continue;
-    const chunkIdx = +m[1];
-    const chunk = chunks[chunkIdx];
-    if (!chunk || !r.ok) continue;
-    const offset = chunkIdx * BATCH_SIZE;
-    let parsed;
-    try { parsed = JSON.parse(r.text); } catch (e) { continue; }
-    for (const item of parsed.classifications || []) {
-      if (item.index == null || item.index >= chunk.length) continue;
-      let wf = item.workflow;
-      if (wf !== 'NONE' && !validNames.has(wf)) wf = 'NONE';
-      classifications[offset + item.index] = { workflow: wf, confidence: item.confidence };
-    }
-  }
 
   clearBatchState();
-  activeBatchId = null;                       // batch done — disable the cancel path
+  activeBatchIds = [];                        // run done — disable the cancel path
   cancelBtn.textContent = 'Cancel';
   await finalizeClassification(tickets, classifications); // keeps progressWrap visible for the theme step
   document.getElementById('progressWrap').style.display = 'none';
@@ -1512,9 +1556,12 @@ async function pollBatchToCompletion(batchId, tickets, chunks) {
 function maybeResumeBatch() {
   const st = loadBatchState();
   if (!st || st.fingerprint !== datasetFingerprint()) return false;
+  const ids = (st.batch_ids || (st.batch_id ? [st.batch_id] : [])) // legacy single-id fallback
+    .filter(id => typeof id === 'string' && id.startsWith('msgbatch_'));
+  if (!ids.length) { clearBatchState(); return false; } // stale/garbage entry — don't auto-resume it
   showError('');
   const tickets = buildTicketsForClassification();
-  pollBatchToCompletion(st.batch_id, tickets, chunkTickets(tickets));
+  pollBatchesToCompletion(ids, tickets, chunkTickets(tickets));
   return true;
 }
 
@@ -1524,22 +1571,24 @@ document.getElementById('classifyBtn').addEventListener('click', () => {
 });
 document.getElementById('cancelBtn').addEventListener('click', async () => {
   cancelRequested = true; // stops the in-browser worker loop and the batch poll loop
-  const id = activeBatchId;
-  if (!id) return; // in-browser mode: runClassification shows "Classification cancelled."
-  // Batch mode: actually cancel the batch on Anthropic (not just stop watching).
-  activeBatchId = null;
+  const ids = activeBatchIds;
+  if (!ids || !ids.length) return; // in-browser mode: runClassification shows "Classification cancelled."
+  // Batch mode: actually cancel every batch of the run on Anthropic (not just stop watching).
+  activeBatchIds = [];
   document.getElementById('cancelBtn').textContent = 'Cancel';
-  document.getElementById('progressText').textContent = 'Cancelling batch...';
+  document.getElementById('progressText').textContent = `Cancelling ${ids.length} batch${ids.length === 1 ? '' : 'es'}...`;
   try {
-    const resp = await fetch(`${API_BASE}/api/batch/cancel`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ batch_id: id }),
-    });
-    const body = await resp.json();
-    if (!body.ok) throw new Error(body.error || 'cancel failed');
+    for (const id of ids) {
+      const resp = await fetch(`${API_BASE}/api/batch/cancel`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ batch_id: id }),
+      });
+      const body = await resp.json();
+      if (!body.ok) throw new Error(body.error || 'cancel failed');
+    }
     showError('Batch cancelled.');
   } catch (err) {
-    showError(`Could not cancel the batch (id ${id}): ${describeError(err)}`);
+    showError(`Could not cancel the batch: ${describeError(err)}`);
   }
   clearBatchState();
   document.getElementById('progressWrap').style.display = 'none';
