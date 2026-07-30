@@ -9,6 +9,8 @@ __pycache__/
 # sample_data/*.csv / *.txt / *.json fixtures are fine and tracked.
 sample_data/*.xlsx
 sample_data/*.xls
+# ...including CSV conversions of the real client exports (e.g. "Tickets Mercor v3.csv").
+sample_data/*Mercor*.csv
 # Larger sample is derived from the real export (real Dutch notes) — local only.
 sample_data/sample_time_entries_large.csv
 
