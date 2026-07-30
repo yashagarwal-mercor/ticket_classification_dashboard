@@ -13,8 +13,7 @@ sample_data/*.xls
 sample_data/sample_time_entries_large.csv
 
 # Internal spec/status docs — kept local, not tracked.
-IMPLEMENTATION.md
-ENT-* Requirements*.md
+specs/
 
 # Local diagnostic script — kept local, not tracked.
 list_batches.py
