@@ -21,11 +21,14 @@ always written by you — the tool does not invent workflows on your behalf.
 
    (On Windows: `.venv\Scripts\activate`)
 
-2. Install the Anthropic Python SDK into the virtual environment:
+2. Install the dependencies into the virtual environment:
 
    ```
-   pip install anthropic
+   pip install anthropic openpyxl
    ```
+
+   (`openpyxl` lets the server stream-parse very large Tickets exports that would
+   otherwise crash the browser tab.)
 
 3. Export your Anthropic API key:
 

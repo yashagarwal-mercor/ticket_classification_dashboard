@@ -11,7 +11,7 @@ Serves the static frontend (static/) and two Anthropic-backed endpoints:
                           generated here -- the user supplies it themselves.
   POST /api/classify   -- classify one batch of rows against the rubric.
                           Uses whatever model the frontend requests
-                          (defaults to claude-haiku-4-5 for bulk classification).
+                          (defaults to claude-sonnet-5 for bulk classification).
 
 Runs entirely server-side because some Anthropic organizations (ones with
 custom data-retention settings) reject direct browser-to-API calls at the
@@ -26,13 +26,16 @@ Run:
 Then open http://localhost:8787
 """
 
+import csv
 import json
 import os
 import re
+import tempfile
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 import anthropic
+import openpyxl
 from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
 from anthropic.types.messages.batch_create_params import Request
 
@@ -45,6 +48,10 @@ if not os.environ.get("ANTHROPIC_API_KEY"):
 client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
 
 INFER_MODEL = "claude-opus-4-8"
+
+# Ticket descriptions can run to ~14k chars; cap them so the projected lookup we return
+# to the browser stays bounded (mirrors META_DESC_CAP in app.js).
+META_DESC_CAP = 4000
 
 # Anthropic batch ids look like "msgbatch_...". Validate before passing a
 # client-supplied id to the SDK (guards against parameter injection).
@@ -96,6 +103,91 @@ def _cached_system(system_text):
     return [{"type": "text", "text": system_text, "cache_control": {"type": "ephemeral"}}]
 
 
+# --- Tickets-export parsing (streamed server-side to keep the 83MB/315MB-XML file
+# off the browser, which OOMs trying to materialize the whole workbook) ---
+
+def _s(v):
+    """Coerce any cell value to a stripped string ('' for blank)."""
+    return "" if v is None else str(v).strip()
+
+
+def _valid_cols(cols):
+    """The candidate-header map must be {field: [header, ...]} of strings."""
+    if not isinstance(cols, dict):
+        return False
+    for k, v in cols.items():
+        if not isinstance(k, str) or not isinstance(v, list):
+            return False
+        if not all(isinstance(x, str) for x in v):
+            return False
+    return True
+
+
+def _open_xlsx(path):
+    """Return (headers, row_iterator, close_fn) for an xlsx, read-only/streamed.
+    We pass a file object (not the path) so openpyxl doesn't reject the temp file's
+    non-.xlsx suffix — it validates by extension only when given a path string."""
+    fh = open(path, "rb")
+    wb = openpyxl.load_workbook(fh, read_only=True, data_only=True)
+    ws = wb.active
+    it = ws.iter_rows(values_only=True)
+    try:
+        headers = [_s(x) for x in next(it)]
+    except StopIteration:
+        headers = []
+
+    def close():
+        wb.close()
+        fh.close()
+
+    return headers, it, close
+
+
+def _open_csv(path):
+    """Return (headers, row_iterator, close_fn) for a CSV, streamed line by line."""
+    fh = open(path, newline="", encoding="utf-8-sig")
+    reader = csv.reader(fh)
+    try:
+        headers = [_s(x) for x in next(reader)]
+    except StopIteration:
+        headers = []
+    return headers, reader, fh.close
+
+
+def _project_tickets(headers, rows_iter, cols):
+    """Stream rows, keeping only the candidate columns, into a compact
+    "<instance>/<ticketnumber>" -> {header: value} lookup. Returns {} if the
+    compound-key columns aren't present (nothing to join on)."""
+    index = {h: i for i, h in enumerate(headers)}
+    present = {}  # field -> the first candidate header that exists in the file
+    for field, cands in cols.items():
+        for h in cands:
+            if h in index:
+                present[field] = h
+                break
+    inst_h, tn_h = present.get("instance"), present.get("ticketnumber")
+    if not inst_h or not tn_h:
+        return {"headers": headers, "byKey": {}, "count": 0}
+    inst_i, tn_i = index[inst_h], index[tn_h]
+    desc_h = present.get("description")
+    store = [(h, index[h]) for h in present.values()]  # (header, column index)
+    by_key = {}
+    for row in rows_iter:
+        n = len(row)
+        inst = _s(row[inst_i]) if inst_i < n else ""
+        tn = _s(row[tn_i]) if tn_i < n else ""
+        if not inst and not tn:
+            continue
+        rec = {}
+        for h, ci in store:
+            v = _s(row[ci]) if ci < n else ""
+            if h == desc_h and len(v) > META_DESC_CAP:
+                v = v[:META_DESC_CAP]
+            rec[h] = v
+        by_key[inst + "/" + tn] = rec
+    return {"headers": headers, "byKey": by_key, "count": len(by_key)}
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=STATIC_DIR, **kwargs)
@@ -145,12 +237,58 @@ class Handler(SimpleHTTPRequestHandler):
             self._handle_batch_create()
         elif self.path == "/api/batch/cancel":
             self._handle_batch_cancel()
+        elif urlparse(self.path).path == "/api/tickets/parse":
+            self._handle_tickets_parse()
         else:
             self._send_json(404, {"ok": False, "error": "not found"})
 
     def _read_body(self):
         length = int(self.headers.get("Content-Length", 0))
         return json.loads(self.rfile.read(length))
+
+    def _handle_tickets_parse(self):
+        """Parse an uploaded Tickets export server-side and return a compact
+        projected lookup. The raw bytes are streamed to a temp file (never held
+        twice in memory); openpyxl read_only streams the sheet at low memory."""
+        tmp_path = None
+        try:
+            parsed = urlparse(self.path)
+            raw_cols = (parse_qs(parsed.query).get("cols") or ["{}"])[0]
+            cols = json.loads(raw_cols)
+            if not _valid_cols(cols):
+                self._send_json(200, {"ok": False, "error": "invalid cols parameter"})
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            if length <= 0:
+                self._send_json(200, {"ok": False, "error": "empty upload"})
+                return
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".upload") as tf:
+                tmp_path = tf.name
+                remaining = length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(remaining, 1 << 20))
+                    if not chunk:
+                        break
+                    tf.write(chunk)
+                    remaining -= len(chunk)
+            with open(tmp_path, "rb") as fh:
+                magic = fh.read(2)
+            headers, rows_iter, close_fn = (
+                _open_xlsx(tmp_path) if magic == b"PK" else _open_csv(tmp_path)
+            )
+            try:
+                result = _project_tickets(headers, rows_iter, cols)
+            finally:
+                close_fn()
+            self._send_json(200, {"ok": True, **result})
+        except Exception as e:
+            self._send_json(200, {"ok": False, "error": str(e)})
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
     def _handle_infer(self):
         try:
