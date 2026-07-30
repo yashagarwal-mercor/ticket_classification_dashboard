@@ -2286,6 +2286,9 @@ function rowsForCompany(company) {
 const _xStr = v => `<Cell><Data ss:Type="String">${xmlEscape(v == null ? '' : v)}</Data></Cell>`;
 const _xNum = v => `<Cell><Data ss:Type="Number">${Number(v || 0)}</Data></Cell>`;
 const _xHdr = v => `<Cell ss:StyleID="Header"><Data ss:Type="String">${xmlEscape(v)}</Data></Cell>`;
+// Excel caps a single cell at 32,767 chars; truncate long free-text (notes) with margin.
+const CELL_CHAR_CAP = 32000;
+const truncCell = v => { const s = v == null ? '' : String(v); return s.length > CELL_CHAR_CAP ? s.slice(0, CELL_CHAR_CAP - 1) + '…' : s; };
 
 // Each cited ticket as "english, dutch (uid)" — falls back to the uid alone when
 // no evidence was captured. Shared by the .xls and TSV exports.
@@ -2367,14 +2370,19 @@ function nonBillableDetailSheetXML(sheetName) {
 }
 
 // Ticket Detail sheet: one flat row per ticket (unfiltered) — ticket id, company,
-// workflow, hours, touches. Workflow falls back to "(not classified)" pre-classification.
+// workflow, hours, touches, plus the ticket-export fields and engineer notes used for
+// classification. Ordered (Title/Issue/Sub/Description/Notes) to mirror how the classifier
+// assembles them. Workflow falls back to "(not classified)" pre-classification.
 function ticketDetailSheetXML(sheetName) {
-  const hdrs = ['Ticket ID', 'Company (Label)', 'Workflow', 'Total Hours', 'Touches'];
+  const hdrs = ['Ticket ID', 'Company (Label)', 'Workflow', 'Total Hours', 'Touches',
+    'Title', 'Issue Type', 'Sub-Issue Type', 'Description', 'Notes'];
   const header = '<Row>' + hdrs.map(_xHdr).join('') + '</Row>';
   const body = ticketRecords.map(r =>
     `<Row>${_xStr(r.ticket_id)}${_xStr(r.company)}${_xStr(r.workflow || '(not classified)')}` +
     `<Cell><Data ss:Type="Number">${(r.hours || 0).toFixed(2)}</Data></Cell>` +
-    `<Cell><Data ss:Type="Number">${r.touches || 0}</Data></Cell></Row>`
+    `<Cell><Data ss:Type="Number">${r.touches || 0}</Data></Cell>` +
+    `${_xStr(r.title || '')}${_xStr(r.issue_type || '')}${_xStr(r.sub_issue_type || '')}` +
+    `${_xStr(truncCell(r.description || ''))}${_xStr(truncCell(r.notes || ''))}</Row>`
   ).join('');
   return `<Worksheet ss:Name="${xmlEscape(sanitizeSheetName(sheetName))}"><Table>${header}${body}</Table></Worksheet>`;
 }
