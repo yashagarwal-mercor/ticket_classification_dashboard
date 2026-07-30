@@ -13,14 +13,20 @@
 <div id="setupSection">
 
   <div class="panel">
-    <h2><span class="step-label">1</span>Time-Entry Export</h2>
+    <h2><span class="step-label">1</span>Upload Exports</h2>
     <div class="field-row">
       <div class="field" style="flex: 2 1 320px;">
-        <label for="fileInput">Upload .xlsx or .csv — one row per time entry</label>
+        <label for="fileInput">Time-entry export * — .xlsx or .csv, one row per time entry</label>
         <input type="file" id="fileInput" accept=".xlsx,.xls,.csv">
+      </div>
+      <div class="field" style="flex: 2 1 320px;">
+        <label for="metaFileInput">Tickets export (optional) — .xlsx or .csv, one row per ticket</label>
+        <input type="file" id="metaFileInput" accept=".xlsx,.xls,.csv">
       </div>
     </div>
     <div class="hint" id="rowCountHint"></div>
+    <div class="hint" id="metaStatus" style="margin-top:4px;"></div>
+    <div class="hint" style="margin-top:6px;">The Tickets export adds ticket-level fields (title, description, issue type) that can sharpen classification, plus the support-queue label used for Responsible Engineer Tier. It's joined onto ticket records automatically when you group (step 4) — map its columns there.</div>
   </div>
 
   <div class="panel">
@@ -122,6 +128,43 @@
         <select id="colContractType"></select>
       </div>
     </div>
+    <div id="metaMapBlock" style="margin-top:12px; padding-top:12px; border-top:1px solid rgba(128,128,128,0.25);">
+      <div class="hint" style="margin-bottom:8px;"><strong>Tickets export columns</strong> (optional) — only used if you uploaded a Tickets export in step 1. Auto-detected for standard TechOne headers; joined onto records by Company + Ticket number.</div>
+      <div class="field-row">
+        <div class="field">
+          <label for="colMetaInstance">Company / instance</label>
+          <select id="colMetaInstance"><option value="">(none)</option></select>
+        </div>
+        <div class="field">
+          <label for="colMetaTicketNumber">Ticket number</label>
+          <select id="colMetaTicketNumber"><option value="">(none)</option></select>
+        </div>
+        <div class="field">
+          <label for="colMetaQueue">Queue / tier label</label>
+          <select id="colMetaQueue"><option value="">(none)</option></select>
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label for="colMetaTitle">Title</label>
+          <select id="colMetaTitle"><option value="">(none)</option></select>
+        </div>
+        <div class="field">
+          <label for="colMetaIssueType">Issue type</label>
+          <select id="colMetaIssueType"><option value="">(none)</option></select>
+        </div>
+        <div class="field">
+          <label for="colMetaSubIssueType">Sub-issue type</label>
+          <select id="colMetaSubIssueType"><option value="">(none)</option></select>
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field" style="flex:1 1 100%;">
+          <label for="colMetaDescription">Description</label>
+          <select id="colMetaDescription"><option value="">(none)</option></select>
+        </div>
+      </div>
+    </div>
     <div style="margin-top:14px;">
       <button class="btn" id="groupBtn">Group into ticket records</button>
       <button class="btn secondary" id="downloadMappingBtn">Download this mapping</button>
@@ -158,39 +201,20 @@
     </div>
   </div>
 
-  <div class="panel" id="ticketMetaPanel" style="display:none;">
-    <h2><span class="step-label">6</span>Ticket Metadata (optional) — Responsible Engineer Tier</h2>
-    <div class="hint" style="margin-bottom:12px;">Upload a ticket-level export (e.g. a TechOne "Tickets" export) that carries the support queue each ticket was worked in. Used only to derive <strong>Responsible Engineer Tier</strong> in the Playbook view — skip this if you don't have it.</div>
-    <div class="field-row" style="align-items:flex-end;">
-      <div class="field" style="flex: 2 1 320px;">
-        <label for="metaFileInput">Upload .xlsx or .csv — one row per ticket</label>
-        <input type="file" id="metaFileInput" accept=".xlsx,.xls,.csv">
-      </div>
-    </div>
-    <div class="field-row">
-      <div class="field">
-        <label for="colMetaInstance">Company / instance *</label>
-        <select id="colMetaInstance"></select>
-      </div>
-      <div class="field">
-        <label for="colMetaTicketNumber">Ticket number *</label>
-        <select id="colMetaTicketNumber"></select>
-      </div>
-      <div class="field">
-        <label for="colMetaQueue">Queue / tier label *</label>
-        <select id="colMetaQueue"></select>
-      </div>
-    </div>
-    <button class="btn secondary small" id="attachMetaBtn">Attach to ticket records</button>
-    <span id="metaStatus" style="margin-left:10px; font-size:12.5px;"></span>
-  </div>
-
   <div class="error-banner" id="errorBanner"></div>
 
   <div class="panel" id="classifyPanel" style="display:none;">
     <div style="margin-bottom:10px;">
       <label><input type="checkbox" id="useBatch" checked> Run via <strong>Batch API</strong> — async, ~50% cheaper, survives closing the tab (recommended for the full dataset). Uncheck for a fast live run on a small slice.</label>
       <span id="batchResumeHint" class="hint" style="display:none; margin-left:6px; color:var(--high);"></span>
+    </div>
+    <div style="margin-bottom:12px;">
+      <div class="hint" style="margin-bottom:6px;">Text sent to the classifier — engineer notes are the base signal; add Tickets-export fields to sharpen classification:</div>
+      <label style="margin-right:14px;"><input type="checkbox" id="txtNotes" checked> Engineer notes</label>
+      <label style="margin-right:14px;"><input type="checkbox" id="txtDescription" checked> Description</label>
+      <label style="margin-right:14px;"><input type="checkbox" id="txtTitle"> Title</label>
+      <label style="margin-right:14px;"><input type="checkbox" id="txtIssueType"> Issue type</label>
+      <label style="margin-right:14px;"><input type="checkbox" id="txtSubIssueType"> Sub-issue type</label>
     </div>
     <button class="btn" id="classifyBtn">Classify Tickets &amp; Build Dashboard</button>
     <button class="btn secondary" id="nonBillableBtn">View Non-Billable Analysis</button>

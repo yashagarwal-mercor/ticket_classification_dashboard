@@ -1,4 +1,4 @@
-const MODEL = "claude-haiku-4-5";
+const MODEL = "claude-sonnet-5"; // bulk classification, reconciliation extraction, Playbook steps
 const MODEL_SUMMARY = "claude-sonnet-5"; // one-shot quality tasks (theme summary, reconciliation)
 const BATCH_SIZE = 12;      // notes bundles are long (full Dutch email threads) — smaller batches than the old 30
 const CONCURRENCY = 5;
@@ -12,12 +12,22 @@ const PLAYBOOK_MIN_EVIDENCE = 5;  // groups with fewer notes-bearing tickets ski
 const PLAYBOOK_SAMPLE = 25;       // max note excerpts sent per (company, workflow) steps-synthesis call
 const TIER_LEVELS = ['Tier 1 (Front-line)', 'Tier 2 (Escalation)', 'Tier 3 (Specialist Engineering)', 'Security / SOC', 'Management / Admin', 'Sales / Account', 'Other / Unclear'];
 
-// Ticket-metadata (optional second file) column mapping — carries the support
-// queue each ticket was worked in, the source for Responsible Engineer Tier.
-const META_COL_SELECTS = { colMetaInstance: 'instance', colMetaTicketNumber: 'ticketnumber', colMetaQueue: 'queue' };
+// Tickets-export (optional second file) column mapping. Carries ticket-level fields
+// (title, description, issue/sub-issue type) that enrich the classification text, plus
+// the support-queue label that is the source for Responsible Engineer Tier.
+const META_COL_SELECTS = {
+  colMetaInstance: 'instance', colMetaTicketNumber: 'ticketnumber',
+  colMetaTitle: 'title', colMetaDescription: 'description',
+  colMetaIssueType: 'issueType', colMetaSubIssueType: 'subIssueType',
+  colMetaQueue: 'queue',
+};
 const META_AUTODETECT = {
   instance: ['all_tickets_tasks[instance]'],
   ticketnumber: ['all_tickets_tasks[ticketnumber]'],
+  title: ['all_tickets_tasks[title]'],
+  description: ['all_tickets_tasks[description]'],
+  issueType: ['ticket_issue_type[label]'],
+  subIssueType: ['ticket_sub_issue_type[label]'],
   queue: ['ticket_queue[label]'],
 };
 
@@ -52,8 +62,11 @@ let coverageInfo = null;   // {total, unclassified, pct, noNotes, themes:[{theme
 let activeBatchId = null;  // set while a Batch API run is being polled; enables the Cancel-batch button
 let reconciliation = null;      // Map(workflowName -> verdict) from Feature A reconciliation (Phase 5)
 let citedEvidenceById = null;   // Map(uid -> {en, nl}) evidence for cited tickets (rendered + persisted)
-let metaHeaders = [];           // headers of the optional ticket-metadata file
-let metaRows = [];              // parsed rows of the optional ticket-metadata file
+let metaHeaders = [];           // headers of the optional Tickets export (for the mapping dropdowns)
+let metaByKey = null;           // Map("company/ticketnumber" -> {headerName: value}) — compact,
+                                // projected lookup for the Tickets export (only the columns we join on).
+                                // We never keep the full rows: the description column alone is ~175M chars
+                                // and materializing every row would OOM the tab on the real 79MB export.
 let tierByQueueLabel = null;    // Map(raw queue label -> canonical tier bucket), from one-shot LLM normalization
 let playbookRows = [];          // built Playbook rows: [{company, workflow, category, tickets, hours, aht, frr, touches, tier, steps, stepsStatus}]
 
@@ -141,7 +154,6 @@ function onFileParsed() {
   document.getElementById('analyzePanel').style.display = 'block';
   document.getElementById('reviewPanel').style.display = 'block';
   document.getElementById('rubricPanel').style.display = 'block';
-  document.getElementById('ticketMetaPanel').style.display = 'block';
   document.getElementById('classifyPanel').style.display = 'block';
   if (!rubric.length) rubric = [{ name: '', category: 'General', description: '' }];
   renderRubricTable();
@@ -280,33 +292,40 @@ document.getElementById('downloadMappingBtn').addEventListener('click', () => {
   showToast('Mapping downloaded (column_mapping.json)');
 });
 
-// --- Ticket-metadata ingestion (optional second file) — carries the support
-// queue/tier each ticket was worked in, joined onto ticketRecords by company+ticket_id. ---
+// --- Tickets-export ingestion (optional second file) — carries ticket-level fields
+// (title/description/issue type) that enrich classification, plus the support-queue label
+// used for Responsible Engineer Tier. Joined onto ticketRecords by company + ticket_id. ---
 
-function handleMetaFile(file) {
-  const reader = new FileReader();
-  const isCSV = /\.csv$/i.test(file.name);
-  reader.onload = (e) => {
-    try {
-      if (isCSV) {
-        const { headers: h, objects } = parseCSV(e.target.result);
-        metaHeaders = h; metaRows = objects;
-      } else {
-        const wb = XLSX.read(e.target.result, { type: 'array' });
-        const sheet = wb.Sheets[wb.SheetNames[0]];
-        const objects = XLSX.utils.sheet_to_json(sheet, { defval: '' });
-        metaHeaders = objects.length ? Object.keys(objects[0]) : [];
-        metaRows = objects;
-      }
-      populateMetaSelectOptions();
-      const statusEl = document.getElementById('metaStatus');
-      statusEl.textContent = `${metaRows.length.toLocaleString()} rows, ${metaHeaders.length} columns detected — review the mapping, then Attach.`;
-      statusEl.style.color = 'var(--text-dim)';
-    } catch (err) {
-      showError('Could not parse the ticket-metadata file: ' + err.message);
+// The Tickets export is huge (~83MB / ~315MB of XML) and OOMs the tab if parsed in-browser
+// with SheetJS. Instead we POST the file to the LOCAL server (server.py), which streams it
+// with openpyxl and returns a compact "<company>/<ticket>" -> {header: value} lookup keyed
+// by header name. The file never leaves the machine (localhost) — DPA-safe.
+async function handleMetaFile(file) {
+  const statusEl = document.getElementById('metaStatus');
+  statusEl.style.color = 'var(--text-dim)';
+  statusEl.textContent = `Parsing “${file.name}” on the local server…`;
+  metaByKey = null; metaHeaders = [];
+  try {
+    const cols = encodeURIComponent(JSON.stringify(META_AUTODETECT));
+    const resp = await fetch(`${API_BASE}/api/tickets/parse?cols=${cols}`, { method: 'POST', body: file });
+    const body = await resp.json();
+    if (!body.ok) {
+      showError('Could not parse the Tickets export: ' + (body.error || 'unknown error'));
+      statusEl.textContent = '';
+      return;
     }
-  };
-  if (isCSV) reader.readAsText(file); else reader.readAsArrayBuffer(file);
+    metaHeaders = body.headers || [];
+    metaByKey = new Map(Object.entries(body.byKey || {}));
+    populateMetaSelectOptions();
+    const n = metaByKey.size;
+    statusEl.textContent = n
+      ? `Tickets export: ${n.toLocaleString()} tickets loaded, ${metaHeaders.length} columns. Joined automatically when you group (step 4).`
+      : `Tickets export loaded, but no instance/ticket-number columns were detected — it won't join. Check the file's headers.`;
+    statusEl.style.color = n ? 'var(--text-dim)' : 'var(--high)';
+  } catch (err) {
+    showError('Tickets export upload failed: ' + describeError(err));
+    statusEl.textContent = '';
+  }
 }
 
 function populateMetaSelectOptions() {
@@ -327,33 +346,35 @@ document.getElementById('metaFileInput').addEventListener('change', (e) => {
   if (e.target.files[0]) handleMetaFile(e.target.files[0]);
 });
 
-// Join the metadata file onto ticketRecords by company+ticketnumber, attaching a raw
-// `queue_label` string per ticket. The label is normalized into a canonical tier
-// bucket later, in runBuildPlaybook() — this step only attaches the raw value.
-document.getElementById('attachMetaBtn').addEventListener('click', () => {
-  const statusEl = document.getElementById('metaStatus');
-  if (!ticketRecords.length) { showError('Group the time-entry file into ticket records first (step 4).'); return; }
-  const instCol = document.getElementById('colMetaInstance').value;
-  const tnCol = document.getElementById('colMetaTicketNumber').value;
-  const queueCol = document.getElementById('colMetaQueue').value;
-  if (!instCol || !tnCol || !queueCol) { showError('Map all three ticket-metadata columns before attaching.'); return; }
-  showError('');
-  const byKey = new Map();
-  for (const row of metaRows) {
-    const inst = String(row[instCol] ?? '').trim();
-    const tn = String(row[tnCol] ?? '').trim();
-    if (!inst && !tn) continue;
-    byKey.set(`${inst}/${tn}`, String(row[queueCol] ?? '').trim() || null);
-  }
+// Join the Tickets export onto ticketRecords by company + ticket number, attaching
+// ticket-level fields (title, description, issue/sub-issue type) used to enrich the
+// classification text, plus the raw queue label (normalized into a support tier later,
+// in runBuildPlaybook()). Runs automatically at the end of runGrouping() whenever a
+// Tickets file has been uploaded — there is no separate "attach" step. Returns the
+// number of ticket records that matched a row in the Tickets export.
+function joinTicketMetadata() {
+  if (!metaByKey || !metaByKey.size) return 0;
+  // Each field maps to a source header chosen in the step-4 dropdowns (auto-detected for
+  // standard TechOne exports). metaByKey stores values by header name, so we resolve by value.
+  const sel = id => document.getElementById(id).value;
+  const titleH = sel('colMetaTitle'), descH = sel('colMetaDescription'),
+        issueH = sel('colMetaIssueType'), subH = sel('colMetaSubIssueType'),
+        queueH = sel('colMetaQueue');
+  const pull = (meta, h) => (h && meta[h] != null ? meta[h] : '');
   let matched = 0;
   for (const rec of ticketRecords) {
-    const q = byKey.get(`${rec.company}/${rec.ticket_id}`);
-    if (q !== undefined) { rec.queue_label = q; if (q) matched++; }
+    const meta = metaByKey.get(`${rec.company}/${rec.ticket_id}`);
+    if (!meta) continue;
+    matched++;
+    rec.title = pull(meta, titleH);
+    rec.description = pull(meta, descH);
+    rec.issue_type = pull(meta, issueH);
+    rec.sub_issue_type = pull(meta, subH);
+    rec.queue_label = pull(meta, queueH) || null;
   }
-  tierByQueueLabel = null; // stale — Build Playbook will re-normalize against the newly attached labels
-  statusEl.textContent = `Attached — ${matched.toLocaleString()} of ${ticketRecords.length.toLocaleString()} ticket records matched a queue label.`;
-  statusEl.style.color = matched > 0 ? 'var(--low)' : 'var(--high)';
-});
+  tierByQueueLabel = null; // stale — Build Playbook re-normalizes against the newly attached labels
+  return matched;
+}
 
 // --- Ticket-record grouping (time entries -> one record per instance+ticketnumber) ---
 
@@ -442,6 +463,26 @@ function runGrouping() {
   ticketRecords = groupTimeEntriesIntoTickets(parsedRows, m);
   if (!ticketRecords.length) { showError('Grouping produced 0 ticket records — check the Company/Ticket-number mapping.'); return false; }
 
+  // Join the optional Tickets export (uploaded in step 1) onto the fresh records.
+  const metaMatched = joinTicketMetadata();
+
+  // When a Tickets export is present, the Tickets view defines the analysis universe:
+  // scope ticketRecords to only the tickets it contains, so classification (and every
+  // downstream view) covers exactly those. Keeps dashboardRows<->ticketRecords 1:1.
+  // If it matched nothing (wrong companies/period), don't zero the dataset — warn instead.
+  let metaNote = '';
+  if (metaByKey && metaByKey.size) {
+    if (metaMatched > 0) {
+      const before = ticketRecords.length;
+      ticketRecords = ticketRecords.filter(r => metaByKey.has(`${r.company}/${r.ticket_id}`));
+      const excluded = before - ticketRecords.length;
+      metaNote = ` Scoped to the Tickets export: <strong>${ticketRecords.length.toLocaleString()}</strong> tickets` +
+        (excluded ? `, excluding <strong>${excluded.toLocaleString()}</strong> time-entry-only tickets not present in it.` : '.');
+    } else {
+      metaNote = ` <span style="color:var(--high)">Tickets export matched 0 of these records — check it covers the same companies/period. Classifying all tickets (not scoped).</span>`;
+    }
+  }
+
   const totalHours = ticketRecords.reduce((s, r) => s + r.hours, 0);
   const nbHours = ticketRecords.reduce((s, r) => s + r.nonbillable_hours, 0);
   const withNotes = ticketRecords.filter(r => r.has_notes).length;
@@ -457,7 +498,7 @@ function runGrouping() {
     `<strong>${companies}</strong> companies. ` +
     `Total ${totalHours.toLocaleString(undefined, {maximumFractionDigits: 0})} h; ` +
     `non-billable ${nbHours.toLocaleString(undefined, {maximumFractionDigits: 0})} h (${nbPct.toFixed(1)}%). ` +
-    `${notesPct.toFixed(0)}% of tickets have ≥1 note.`;
+    `${notesPct.toFixed(0)}% of tickets have ≥1 note.` + metaNote;
 
   const statusEl = document.getElementById('groupStatus');
   statusEl.textContent = 'Grouped ✓';
@@ -1074,17 +1115,40 @@ function describeError(err) {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Build the per-ticket classification inputs from the grouped records. The signal is
-// the concatenated notes (mostly Dutch) prefixed with label/contract tags.
+// the concatenated engineer notes (mostly Dutch), optionally preceded by the ticket-export
+// fields the user checked in the classify panel (title / issue type / description).
+
+// Read the classify-panel checkboxes that pick which fields go into the classifier text.
+// Falls back to the shipped defaults (notes + description on) when a checkbox is absent.
+function classifyTextOptions() {
+  const on = (id, dflt) => { const el = document.getElementById(id); return el ? el.checked : dflt; };
+  return {
+    notes: on('txtNotes', true),
+    description: on('txtDescription', true),
+    title: on('txtTitle', false),
+    issueType: on('txtIssueType', false),
+    subIssueType: on('txtSubIssueType', false),
+  };
+}
+
 function buildTicketsForClassification() {
+  const opt = classifyTextOptions();
   return ticketRecords.map(rec => {
-    const tags = [
-      rec.labels.length ? `Labels: ${rec.labels.join(', ')}` : '',
-      rec.contract_types.length ? `Contract: ${rec.contract_types.join(', ')}` : '',
-    ].filter(Boolean).join(' | ');
+    // Ticket context first (title / issue type / description), then label+contract tags,
+    // then the engineer notes — mirrors how a human reads the ticket top-down.
+    const parts = [];
+    if (opt.title && rec.title) parts.push(`Title: ${rec.title}`);
+    const issueBits = [opt.issueType ? rec.issue_type : '', opt.subIssueType ? rec.sub_issue_type : ''].filter(Boolean);
+    if (issueBits.length) parts.push(`Issue type: ${issueBits.join(' / ')}`);
+    if (opt.description && rec.description) parts.push(`Description: ${rec.description}`);
+    // Labels (KPI level 1) and Contract type are deliberately NOT injected here: they're
+    // billing/commercial metadata, not descriptive of the work, so they dilute the prompt.
+    // rec.labels / rec.contract_types are still kept for the Non-Billable + dashboard views.
+    if (opt.notes && rec.notes) parts.push(rec.notes);
     return {
       ticket_id: rec.ticket_id,
       company: rec.company,
-      text: (tags ? tags + '\n' : '') + (rec.notes || '(no notes)'),
+      text: parts.length ? parts.join('\n') : '(no notes)',
       hours: rec.hours,
       touches: rec.touches,
       firstTouchResolved: null,
