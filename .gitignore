@@ -20,3 +20,6 @@ specs/
 # Local diagnostic scripts — kept local, not tracked.
 list_batches.py
 batch_durations.py
+
+# Run outputs and analysis exports — generated locally, not tracked.
+results/
